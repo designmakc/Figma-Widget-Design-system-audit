@@ -25,6 +25,7 @@ interface UnboundProperty {
   currentValue?: string
   nodePath?: string
   nodeId?: string  // Store the actual node ID for direct navigation
+  ruleId?: string  // DS rule id for tokenMisuse findings (per-rule settings filter)
 }
 
 interface ComponentAuditData {
@@ -133,16 +134,29 @@ const DS_SPACING_PROP_LABELS: Record<string, string> = {
 // Closed layout/ vocabulary (spacing-layout-vocabulary, rules v1.3.0)
 const DS_LAYOUT_VOCAB = /^layout\/(page\/margin\/(horizontal|vertical)|container\/padding\/(horizontal|vertical)|content\/gap\/(horizontal|vertical)|grid\/gutter)$/
 
+// ruleId → settings key: per-rule visibility toggles in the settings panel
+const DS_RULE_SETTINGS: Record<string, string> = {
+  'spacing-category-property-match': 'showRuleSpacingCategory',
+  'spacing-layout-vocabulary': 'showRuleLayoutVocab',
+  'spacing-region-scope': 'showRuleRegionScope',
+  'spacing-bind-semantic-layer': 'showRuleSemanticLayer',
+  'tier-discipline': 'showRuleTierDiscipline',
+  'tokens-no-disabled-suffix-leaf': 'showRuleDisabledLeaf',
+  'tokens-no-component-tier': 'showRuleComponentTier',
+  'gradient-stop-unbound': 'showRuleGradientStops'
+}
+
 const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]> => {
   const findings: UnboundProperty[] = []
 
-  const report = (node: SceneNode, path: string, property: string, message: string) => {
+  const report = (node: SceneNode, path: string, property: string, ruleId: string, message: string) => {
     findings.push({
       type: 'tokenMisuse',
       property,
       currentValue: safeText(message),
       nodePath: safeText(path),
-      nodeId: node.id
+      nodeId: node.id,
+      ruleId
     })
   }
 
@@ -153,19 +167,19 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
     // spacing-bind-semantic-layer (hard): device collection is a hidden engine —
     // bind the semantic layer. Exceptions by design: visible/* booleans, system/device.
     if (collection === 'device' && !v.name.startsWith('visible/') && v.name !== 'system/device') {
-      report(node, path, propLabel, `"${v.name}" bound from "device" collection — bind the "semantic" layer instead (spacing-bind-semantic-layer)`)
+      report(node, path, propLabel, 'spacing-bind-semantic-layer', `«${v.name}» привязан из коллекции device — биндить semantic-слой (spacing-bind-semantic-layer)`)
     }
 
     // Tier discipline: components bind semantic tokens, not primitives directly
     if (collection.startsWith('primitive') || v.name.startsWith('primitive/')) {
-      report(node, path, propLabel, `"${v.name}" is a primitive-tier token — bind a semantic token instead (tier-discipline)`)
+      report(node, path, propLabel, 'tier-discipline', `«${v.name}» — primitive-токен, биндить semantic-уровень (tier-discipline)`)
     }
 
     // tokens-no-disabled-suffix-leaf (DEC-024, hard): <word>Disabled leafs are banned —
     // disabled is implemented via opacity/disabled overlay (DEC-023)
     const leaf = v.name.split('/').pop() || ''
     if (/^[a-zA-Z]+Disabled$/.test(leaf)) {
-      report(node, path, propLabel, `"${v.name}" uses banned <word>Disabled leaf — use opacity/disabled overlay (tokens-no-disabled-suffix-leaf, DEC-024)`)
+      report(node, path, propLabel, 'tokens-no-disabled-suffix-leaf', `«${v.name}» — запрещённый leaf <word>Disabled; disabled делается через opacity/disabled overlay (tokens-no-disabled-suffix-leaf, DEC-024)`)
     }
 
     // tokens-no-component-tier (DEC-014, soft): middle segment must not repeat a component slug
@@ -173,7 +187,7 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
     const middles = segments.slice(1, -1)
     const hit = middles.find(seg => dsComponentSlugs.has(seg.toLowerCase()))
     if (hit) {
-      report(node, path, propLabel, `"${v.name}" middle segment "${hit}" matches a component name — tokens must be role/category-tier (tokens-no-component-tier, DEC-014)`)
+      report(node, path, propLabel, 'tokens-no-component-tier', `«${v.name}» — сегмент «${hit}» совпадает с именем компонента; токены должны быть role/category-tier (tokens-no-component-tier, DEC-014)`)
     }
   }
 
@@ -184,7 +198,10 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
 
     if (bv) {
       // --- Spacing props: category and region rules ---
+      // Grid layout: itemSpacing/gap are stale flow-layout leftovers — skip them
+      const isGridLayout = (node as any).layoutMode === 'GRID'
       for (const key of [...DS_GAP_PROPS, ...DS_PADDING_PROPS]) {
+        if (isGridLayout && DS_GAP_PROPS.indexOf(key) !== -1) continue
         const alias = bv[key]
         if (alias && alias.type === 'VARIABLE_ALIAS') {
           const v = await resolveBoundVar(alias.id)
@@ -196,21 +213,21 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
 
           // spacing-category-property-match (hard): token category must match property category
           if (isGapProp && /(^|\/)(padding|margin)\//.test(v.name)) {
-            report(node, path, label, `bound to "${v.name}" — gap properties take */gap/* tokens only (spacing-category-property-match)`)
+            report(node, path, label, 'spacing-category-property-match', `привязан «${v.name}» — на gap-свойства только */gap/* токены (spacing-category-property-match)`)
           }
           if (!isGapProp && /(^|\/)gap\//.test(v.name)) {
-            report(node, path, label, `bound to "${v.name}" — padding properties take */padding/* or */margin/* tokens only (spacing-category-property-match)`)
+            report(node, path, label, 'spacing-category-property-match', `привязан «${v.name}» — на padding-свойства только */padding/* или */margin/* токены (spacing-category-property-match)`)
           }
 
           // spacing-layout-vocabulary (hard): layout/ names come from the closed vocabulary
           if (v.name.startsWith('layout/') && !DS_LAYOUT_VOCAB.test(v.name)) {
-            report(node, path, label, `bound to "${v.name}" — not in the layout/ vocabulary (layout/{page/margin|container/padding|content/gap}/{axis}, layout/grid/gutter) (spacing-layout-vocabulary)`)
+            report(node, path, label, 'spacing-layout-vocabulary', `привязан «${v.name}» — вне словаря layout/ (layout/{page/margin|container/padding|content/gap}/{ось}, layout/grid/gutter) (spacing-layout-vocabulary)`)
           }
 
           // spacing-region-scope: page-frame tokens inside components are legal only for
           // positioning a fullscreen overlay against the viewport — review any other use
           if (v.name.startsWith('layout/page/')) {
-            report(node, path, label, `bound to "${v.name}" — page-scope token inside a component; legal only for fullscreen-overlay viewport positioning, review (spacing-region-scope)`)
+            report(node, path, label, 'spacing-region-scope', `привязан «${v.name}» — page-токен внутри компонента; легален только для позиционирования полноэкранного оверлея от вьюпорта, проверить (spacing-region-scope)`)
           }
         }
       }
@@ -249,7 +266,7 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
                 const bound = stop.boundVariables && stop.boundVariables.color &&
                               stop.boundVariables.color.type === 'VARIABLE_ALIAS'
                 if (!bound) {
-                  report(node, path, `Gradient ${pi + 1} stop ${si + 1}`, `stop color not bound to a color/gradient/* variable (gradient-stop-unbound, DEC-036)`)
+                  report(node, path, `Gradient ${pi + 1} stop ${si + 1}`, 'gradient-stop-unbound', `цвет стопа не привязан к переменной color/gradient/* (gradient-stop-unbound, DEC-036)`)
                 }
               })
             }
@@ -425,6 +442,15 @@ interface SettingsState {
   showMissingDocsLink: boolean
   showMissingVariables: boolean
   showTokenMisuse: boolean
+  // DS rules group (per-rule toggles)
+  showRuleSpacingCategory: boolean
+  showRuleLayoutVocab: boolean
+  showRuleRegionScope: boolean
+  showRuleSemanticLayer: boolean
+  showRuleTierDiscipline: boolean
+  showRuleDisabledLeaf: boolean
+  showRuleComponentTier: boolean
+  showRuleGradientStops: boolean
   hideZeroValues: boolean
   showFillValues: boolean
   // Stroke group
@@ -475,6 +501,14 @@ function Widget() {
     showMissingDocsLink: true,
     showMissingVariables: true,
     showTokenMisuse: true,
+    showRuleSpacingCategory: true,
+    showRuleLayoutVocab: true,
+    showRuleRegionScope: true,
+    showRuleSemanticLayer: true,
+    showRuleTierDiscipline: true,
+    showRuleDisabledLeaf: true,
+    showRuleComponentTier: true,
+    showRuleGradientStops: true,
     hideZeroValues: true,
     showFillValues: true,
     // Stroke group
@@ -799,9 +833,12 @@ function Widget() {
           // Check for hardcoded itemSpacing values
           // Skip spacing checks if primaryAxisAlignItems is 'SPACE_BETWEEN' (indicates "auto" spacing)
           const isAutoSpacing = layoutNode.primaryAxisAlignItems === 'SPACE_BETWEEN';
-          
+          // Grid layout: itemSpacing/gap are stale flow-layout leftovers, not what the
+          // grid actually uses — checking them produces false positives
+          const isGridLayout = (layoutNode as any).layoutMode === 'GRID';
+
           // Check gap property (newer Figma property for spacing between items)
-          if ('gap' in layoutNode && typeof (layoutNode as any).gap === 'number' && !isAutoSpacing) {
+          if (!isGridLayout && 'gap' in layoutNode && typeof (layoutNode as any).gap === 'number' && !isAutoSpacing) {
             const gap = (layoutNode as any).gap;
             const boundVar = layoutNode.boundVariables && (layoutNode.boundVariables as any).gap;
             const hasGapVar = boundVar && 
@@ -820,7 +857,7 @@ function Widget() {
           }
           
           // Check itemSpacing property (older property, still used in some cases)
-          if ('itemSpacing' in layoutNode && layoutNode.itemSpacing >= 0 && !isAutoSpacing) {
+          if (!isGridLayout && 'itemSpacing' in layoutNode && layoutNode.itemSpacing >= 0 && !isAutoSpacing) {
             const boundVar = layoutNode.boundVariables && layoutNode.boundVariables.itemSpacing;
             const hasItemSpacingVar = boundVar && 
                                      typeof boundVar === 'object' &&
@@ -1226,7 +1263,7 @@ function Widget() {
     setSelectionError(null)
 
     try {
-      setCurrentProgress('Running quick scan...')
+      setCurrentProgress('Быстрый скан…')
       
       await figma.loadAllPagesAsync()
       const allPages = figma.root.children.filter(child => child.type === 'PAGE') as PageNode[]
@@ -1269,11 +1306,11 @@ function Widget() {
 
       setQuickScanData(quickData)
       setLastScanTime(new Date().toUTCString())
-      setCurrentProgress('Quick scan complete!')
+      setCurrentProgress('Быстрый скан завершён!')
 
     } catch (error) {
       console.error('Error during quick scan:', error)
-      setCurrentProgress('Error occurred during quick scan')
+      setCurrentProgress('Ошибка при быстром скане')
     } finally {
       setIsQuickScanning(false)
       setTimeout(() => {
@@ -1287,7 +1324,7 @@ function Widget() {
   const generateSummaryText = (): string => {
     if (!quickScanData) return ''
     
-    return `Out of ${quickScanData.totalPages} pages, ${quickScanData.pagesWithComponents} have components. We found ${quickScanData.uniqueComponents} unique components and ${quickScanData.totalVariants} total variants. ${quickScanData.withoutDescription}/${quickScanData.totalVariants} components do not have a description set, and ${quickScanData.withoutDocs}/${quickScanData.totalVariants} components do not have a documentation link. ${quickScanData.hiddenComponents} components are hidden from publishing.`
+    return `Из ${quickScanData.totalPages} страниц компоненты есть на ${quickScanData.pagesWithComponents}. Найдено ${quickScanData.uniqueComponents} уникальных компонентов и ${quickScanData.totalVariants} вариантов. Без описания — ${quickScanData.withoutDescription}/${quickScanData.totalVariants}, без ссылки на документацию — ${quickScanData.withoutDocs}/${quickScanData.totalVariants}. Скрыто из публикации — ${quickScanData.hiddenComponents}.`
   }
 
   const createSummaryFrame = async () => {
@@ -1296,7 +1333,7 @@ function Widget() {
     try {
       // Create a frame for the summary
       const frame = figma.createFrame()
-      frame.name = `Component audit summary - ${new Date().toLocaleDateString()}`
+      frame.name = `Сводка аудита компонентов — ${new Date().toLocaleDateString()}`
       frame.resize(400, 400)
       
       // Set frame background to match widget
@@ -1338,7 +1375,7 @@ function Widget() {
       await figma.loadFontAsync({ family: "Inter", style: "Bold" })
       title.fontName = { family: "Inter", style: "Bold" }
       title.fontSize = 14
-      title.characters = "🔍 Component audit"
+      title.characters = "🔍 Аудит компонентов"
       title.fills = [{ type: 'SOLID', color: { r: 0.2, g: 0.2, b: 0.2 } }]
       title.resize(368, title.height) // Fill container width (400 - 32px padding)
       headerFrame.appendChild(title)
@@ -1348,7 +1385,7 @@ function Widget() {
       await figma.loadFontAsync({ family: "Inter", style: "Regular" })
       timestamp.fontName = { family: "Inter", style: "Regular" }
       timestamp.fontSize = 12
-      timestamp.characters = `Generated on ${new Date().toUTCString()}`
+      timestamp.characters = `Сгенерировано ${new Date().toUTCString()}`
       timestamp.fills = [{ type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }]
       timestamp.resize(368, timestamp.height) // Fill container width
       headerFrame.appendChild(timestamp)
@@ -1385,19 +1422,19 @@ function Widget() {
       const statsTitle = figma.createText()
       statsTitle.fontName = { family: "Inter", style: "Bold" }
       statsTitle.fontSize = 14
-      statsTitle.characters = "📊 Detailed Breakdown"
+      statsTitle.characters = "📊 Подробная разбивка"
       statsTitle.fills = [{ type: 'SOLID', color: { r: 0.55, g: 0, b: 0.55 } }]
       statsFrame.appendChild(statsTitle)
 
       // Create individual stat items
       const stats = [
-        { label: "Total Pages", value: quickScanData.totalPages.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Pages with Components", value: quickScanData.pagesWithComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Unique Components", value: quickScanData.uniqueComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Total Variants", value: quickScanData.totalVariants.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Missing Descriptions", value: `${quickScanData.withoutDescription}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
-        { label: "Missing Documentation", value: `${quickScanData.withoutDocs}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
-        { label: "Hidden Components", value: quickScanData.hiddenComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } }
+        { label: "Всего страниц", value: quickScanData.totalPages.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
+        { label: "Страниц с компонентами", value: quickScanData.pagesWithComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
+        { label: "Уникальных компонентов", value: quickScanData.uniqueComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
+        { label: "Всего вариантов", value: quickScanData.totalVariants.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
+        { label: "Без описания", value: `${quickScanData.withoutDescription}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
+        { label: "Без ссылки на документацию", value: `${quickScanData.withoutDocs}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
+        { label: "Скрыто из публикации", value: quickScanData.hiddenComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } }
       ]
 
       for (const stat of stats) {
@@ -1460,7 +1497,7 @@ function Widget() {
       const jsonTitle = figma.createText()
       jsonTitle.fontName = { family: "Inter", style: "Bold" }
       jsonTitle.fontSize = 10
-      jsonTitle.characters = "📋 JSON Export – For versioning"
+      jsonTitle.characters = "📋 JSON-экспорт — для версионирования"
       jsonTitle.fills = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0 } }]
       jsonSectionFrame.appendChild(jsonTitle)
 
@@ -1506,7 +1543,7 @@ function Widget() {
       figma.currentPage.selection = [frame]
       figma.viewport.scrollAndZoomIntoView([frame])
 
-      figma.notify('✅ Summary frame created on canvas!')
+      figma.notify('✅ Сводка добавлена на канвас!')
 
     } catch (error) {
       console.error('Error creating summary frame:', error)
@@ -1611,9 +1648,12 @@ function Widget() {
         case 'appearance':
           shouldShow = settings.showAppearanceValues
           break
-        case 'tokenMisuse':
-          shouldShow = settings.showTokenMisuse
+        case 'tokenMisuse': {
+          const ruleKey = prop.ruleId ? DS_RULE_SETTINGS[prop.ruleId] : undefined
+          const ruleEnabled = ruleKey ? (settings as any)[ruleKey] !== false : true
+          shouldShow = settings.showTokenMisuse && ruleEnabled
           break
+        }
         default:
           shouldShow = true
       }
@@ -1739,7 +1779,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     }
   } catch (error) {
     console.error('Error navigating to node:', error)
-    figma.notify('Could not navigate to node')
+    figma.notify('Не удалось перейти к узлу')
   }
 }
 
@@ -1763,6 +1803,14 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showMissingDocsLink: true,
       showMissingVariables: true,
       showTokenMisuse: true,
+      showRuleSpacingCategory: true,
+      showRuleLayoutVocab: true,
+      showRuleRegionScope: true,
+      showRuleSemanticLayer: true,
+      showRuleTierDiscipline: true,
+      showRuleDisabledLeaf: true,
+      showRuleComponentTier: true,
+      showRuleGradientStops: true,
       hideZeroValues: true,
       showFillValues: true,
       // Stroke group
@@ -1870,48 +1918,37 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       <AutoLayout direction="vertical" spacing={12} padding={12} fill="#FAECFF" cornerRadius={16} width="fill-parent">
         {/* <Text fontSize={12} fontWeight={700}>Quick Scan Results</Text> */}
         <AutoLayout direction="horizontal" spacing={4} width="fill-parent" wrap={true}>
-          <Text fontSize={16} fill="#8C00BA">Out</Text>
-          <Text fontSize={16} fill="#8C00BA">of</Text>
+          <Text fontSize={16} fill="#8C00BA">Из</Text>
           <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalPages)}</Text>
-          <Text fontSize={16} fill="#8C00BA">pages,</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}</Text>
-          <Text fontSize={16} fill="#8C00BA">have</Text>
-          <Text fontSize={16} fill="#8C00BA">components.</Text>
-          <Text fontSize={16} fill="#8C00BA">We</Text>
-          <Text fontSize={16} fill="#8C00BA">found</Text>
+          <Text fontSize={16} fill="#8C00BA">страниц</Text>
+          <Text fontSize={16} fill="#8C00BA">компоненты</Text>
+          <Text fontSize={16} fill="#8C00BA">есть</Text>
+          <Text fontSize={16} fill="#8C00BA">на</Text>
+          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}.</Text>
+          <Text fontSize={16} fill="#8C00BA">Найдено</Text>
           <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.uniqueComponents)}</Text>
-          <Text fontSize={16} fill="#8C00BA">unique</Text>
-          <Text fontSize={16} fill="#8C00BA">components</Text>
-          <Text fontSize={16} fill="#8C00BA">and</Text>
+          <Text fontSize={16} fill="#8C00BA">уникальных</Text>
+          <Text fontSize={16} fill="#8C00BA">компонентов</Text>
+          <Text fontSize={16} fill="#8C00BA">и</Text>
           <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalVariants)}</Text>
-          <Text fontSize={16} fill="#8C00BA">total</Text>
-          <Text fontSize={16} fill="#8C00BA">variants.</Text>
-          
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)}</Text>
-          <Text fontSize={16} fill="#8C00BA">components</Text>
-          <Text fontSize={16} fill="#8C00BA">do</Text>
-          <Text fontSize={16} fill="#8C00BA">not</Text>
-          <Text fontSize={16} fill="#8C00BA">have</Text>
-          <Text fontSize={16} fill="#8C00BA">a</Text>
-          <Text fontSize={16} fill="#8C00BA">description</Text>
-          <Text fontSize={16} fill="#8C00BA">set,</Text>
-          <Text fontSize={16} fill="#8C00BA">and</Text>
-          
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}</Text>
-          <Text fontSize={16} fill="#8C00BA">components</Text>
-          <Text fontSize={16} fill="#8C00BA">do</Text>
-          <Text fontSize={16} fill="#8C00BA">not</Text>
-          <Text fontSize={16} fill="#8C00BA">have</Text>
-          <Text fontSize={16} fill="#8C00BA">a</Text>
-          <Text fontSize={16} fill="#8C00BA">documentation</Text>
-          <Text fontSize={16} fill="#8C00BA">link.</Text>
-          
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}</Text>
-          <Text fontSize={16} fill="#8C00BA">components</Text>
-          <Text fontSize={16} fill="#8C00BA">are</Text>
-          <Text fontSize={16} fill="#8C00BA">hidden</Text>
-          <Text fontSize={16} fill="#8C00BA">from</Text>
-          <Text fontSize={16} fill="#8C00BA">publishing.</Text>
+          <Text fontSize={16} fill="#8C00BA">вариантов.</Text>
+
+          <Text fontSize={16} fill="#8C00BA">Без</Text>
+          <Text fontSize={16} fill="#8C00BA">описания</Text>
+          <Text fontSize={16} fill="#8C00BA">—</Text>
+          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)},</Text>
+          <Text fontSize={16} fill="#8C00BA">без</Text>
+          <Text fontSize={16} fill="#8C00BA">ссылки</Text>
+          <Text fontSize={16} fill="#8C00BA">на</Text>
+          <Text fontSize={16} fill="#8C00BA">документацию</Text>
+          <Text fontSize={16} fill="#8C00BA">—</Text>
+          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}.</Text>
+
+          <Text fontSize={16} fill="#8C00BA">Скрыто</Text>
+          <Text fontSize={16} fill="#8C00BA">из</Text>
+          <Text fontSize={16} fill="#8C00BA">публикации</Text>
+          <Text fontSize={16} fill="#8C00BA">—</Text>
+          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}.</Text>
         </AutoLayout>
 
         <AutoLayout direction="horizontal" spacing={8} verticalAlignItems="center">
@@ -1924,12 +1961,12 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
             onClick={createSummaryFrame}
             hoverStyle={{ fill: "#FCF5FF", stroke: "#8C00BA" }}
           >
-            <Text fontSize={12} fill="#69008C" fontWeight={600}>Add summary to the canvas</Text>
+            <Text fontSize={12} fill="#69008C" fontWeight={600}>Сводку на канвас</Text>
           </AutoLayout>
-          
+
           {lastScanTime && (
             <Text fontSize={11} fill="#8C00BA">
-              {`Scanned at ${safeText(lastScanTime)}`}
+              {`Скан: ${safeText(lastScanTime)}`}
             </Text>
           )}
         </AutoLayout>
@@ -1941,7 +1978,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     if (!isDeepScanning && pageProgress.length === 0) return null
 
     // Check if deep scan is complete
-    const isDeepScanComplete = currentProgress.includes('Deep scan complete')
+    const isDeepScanComplete = currentProgress.includes('Глубокий скан завершён')
     const backgroundColor = isDeepScanComplete ? '#EFFFEC' : '#f5f5f5'
     const textColor = isDeepScanComplete ? '#106A00' : '#222'
 
@@ -1963,7 +2000,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
             <ChevronRightIcon color={textColor} size={16} />
           )}
           <Text fontSize={12} fontWeight={600} fill={textColor} width="fill-parent">
-            {safeText(currentProgress) !== 'N/A' ? safeText(currentProgress) : 'Processing...'}
+            {safeText(currentProgress) !== 'N/A' ? safeText(currentProgress) : 'Обработка…'}
           </Text>
         </AutoLayout>
         
@@ -1988,9 +2025,9 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                       <Text fontSize={12} width={150} fill="#106A00">{safeText(page.name)}</Text>
                     </AutoLayout>
                     <Text fontSize={12} fill="#106A00">
-                  {page.status === 'complete' ? `${safeText(page.componentCount)} components` : 
-                   page.status === 'loading' ? 'Loading...' :
-                   page.status === 'error' ? 'Error' : 'Waiting...'}
+                  {page.status === 'complete' ? `${safeText(page.componentCount)} комп.` :
+                   page.status === 'loading' ? 'Загрузка…' :
+                   page.status === 'error' ? 'Ошибка' : 'Ожидание…'}
                 </Text>
               </AutoLayout>
             ))}
@@ -2026,20 +2063,20 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     }, {} as Record<string, UnboundProperty[]>)
 
     const typeLabels = {
-      fill: '🎨 Colors (Fill)',
-      stroke: '🖊️ Stroke Properties',
-      text: '📝 Typography',
-      cornerRadius: '📐 Corner Radius',
-      spacing: '📏 Spacing',
-      effect: '✨ Effects',
-      appearance: '👁️ Appearance',
-      tokenMisuse: '🚨 DS Rule Violations',
-      unknown: '❓ Unknown Type'
+      fill: '🎨 Цвета (Fill)',
+      stroke: '🖊️ Обводка',
+      text: '📝 Типографика',
+      cornerRadius: '📐 Радиус углов',
+      spacing: '📏 Отступы',
+      effect: '✨ Эффекты',
+      appearance: '👁️ Прозрачность',
+      tokenMisuse: '🚨 Нарушения правил ДС',
+      unknown: '❓ Неизвестный тип'
     }
 
     return (
       <AutoLayout direction="vertical" spacing={12} width="fill-parent" padding={{ bottom: 12 }}>
-        <Text fontSize={12} fontWeight={600} fill="#000">Properties without variables/styles</Text>
+        <Text fontSize={12} fontWeight={600} fill="#000">Свойства без переменных/стилей</Text>
         
         {Object.keys(groupedProperties).map((type, typeIndex) => (
           <AutoLayout key={`type-${type}-${typeIndex}`} direction="vertical" spacing={8} width="fill-parent">
@@ -2094,7 +2131,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       console.error('Error in UnboundPropertiesDetail:', error)
       return (
         <AutoLayout direction="vertical" spacing={8} padding={8} fill="#FFEBEE" cornerRadius={4} width="fill-parent">
-          <Text fontSize={11} fill="#C62828">Error rendering unbound properties</Text>
+          <Text fontSize={11} fill="#C62828">Ошибка отображения свойств</Text>
       </AutoLayout>
     )
     }
@@ -2303,25 +2340,25 @@ const SettingsPanel = ({
     <AutoLayout direction="vertical" spacing={8} padding={{ left: 8, right: 12, top: 0, bottom: 12 }} width="fill-parent">
       {/* Top-level checkboxes */}
       <AutoLayout direction="horizontal" spacing={2} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-        <SimpleCheckbox 
-          checked={settings.showMissingDescription} 
-          label="Component description" 
+        <SimpleCheckbox
+          checked={settings.showMissingDescription}
+          label="Описание компонента"
           onClick={() => toggleSetting('showMissingDescription')}
           isFirst={true}
         />
-        <SimpleCheckbox 
-          checked={settings.showMissingDocsLink} 
-          label="Documentation link" 
+        <SimpleCheckbox
+          checked={settings.showMissingDocsLink}
+          label="Ссылка на документацию"
           onClick={() => toggleSetting('showMissingDocsLink')}
         />
         <SimpleCheckbox
           checked={settings.showMissingVariables}
-          label="Variables"
+          label="Переменные"
           onClick={() => toggleSetting('showMissingVariables')}
         />
         <SimpleCheckbox
           checked={settings.showTokenMisuse}
-          label="DS rules"
+          label="Правила ДС"
           onClick={() => toggleSetting('showTokenMisuse')}
           isLast={true}
         />
@@ -2341,7 +2378,7 @@ const SettingsPanel = ({
           ) : (
             <ChevronRightIcon color="#333333" size={12} />
           )}
-          <Text fontSize={11} fontWeight={600} fill="#333333">Individual properties</Text>
+          <Text fontSize={11} fontWeight={600} fill="#333333">Отдельные свойства</Text>
         </AutoLayout>
         
         {isIndividualPropsExpanded && (
@@ -2349,17 +2386,17 @@ const SettingsPanel = ({
             {/* Fill, Opacity, Ignore "0" values */}
             <AutoLayout direction="horizontal" spacing={4} wrap={true} width="hug-contents">
               <AutoLayout direction="horizontal" spacing={1} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-                <SimpleCheckbox checked={settings.showFillValues} label="Fill" onClick={() => toggleSetting('showFillValues')} isFirst={true} isLast={true} />
+                <SimpleCheckbox checked={settings.showFillValues} label="Заливка" onClick={() => toggleSetting('showFillValues')} isFirst={true} isLast={true} />
               </AutoLayout>
-              
+
               <AutoLayout direction="horizontal" spacing={1} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-                <SimpleCheckbox checked={settings.showAppearanceValues} label="Opacity" onClick={() => toggleSetting('showAppearanceValues')} isFirst={true} isLast={true} />
+                <SimpleCheckbox checked={settings.showAppearanceValues} label="Прозрачность" onClick={() => toggleSetting('showAppearanceValues')} isFirst={true} isLast={true} />
               </AutoLayout>
-              
+
               <AutoLayout direction="horizontal" spacing={1} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-                <SimpleCheckbox 
-                  checked={settings.hideZeroValues} 
-                  label='Ignore "0" values' 
+                <SimpleCheckbox
+                  checked={settings.hideZeroValues}
+                  label="Игнорировать «0»"
                   onClick={() => toggleSetting('hideZeroValues')}
                   isFirst={true}
                   isLast={true}
@@ -2369,45 +2406,58 @@ const SettingsPanel = ({
             
             {/* Stroke group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showStrokeColorValues} label="Stroke" onClick={() => toggleSetting('showStrokeColorValues')} isFirst={true} />
-              <SimpleCheckbox checked={settings.showStrokeColorValues} label="Stroke color" onClick={() => toggleSetting('showStrokeColorValues')} />
-              <SimpleCheckbox checked={settings.showStrokeWeightValues} label="Weight" onClick={() => toggleSetting('showStrokeWeightValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showStrokeColorValues} label="Обводка" onClick={() => toggleSetting('showStrokeColorValues')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showStrokeColorValues} label="Цвет обводки" onClick={() => toggleSetting('showStrokeColorValues')} />
+              <SimpleCheckbox checked={settings.showStrokeWeightValues} label="Толщина" onClick={() => toggleSetting('showStrokeWeightValues')} isLast={true} />
             </AutoLayout>
             
             {/* Text group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showFontFamilyValues} label="Text" onClick={() => toggleSetting('showFontFamilyValues')} isFirst={true} />
-              <SimpleCheckbox checked={settings.showFontFamilyValues} label="Family" onClick={() => toggleSetting('showFontFamilyValues')} />
-              <SimpleCheckbox checked={settings.showFontSizeValues} label="Size" onClick={() => toggleSetting('showFontSizeValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Line height" onClick={() => toggleSetting('showLineHeightValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Letter spacing" onClick={() => toggleSetting('showLineHeightValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Paragraph spacing" onClick={() => toggleSetting('showLineHeightValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showFontFamilyValues} label="Текст" onClick={() => toggleSetting('showFontFamilyValues')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showFontFamilyValues} label="Шрифт" onClick={() => toggleSetting('showFontFamilyValues')} />
+              <SimpleCheckbox checked={settings.showFontSizeValues} label="Кегль" onClick={() => toggleSetting('showFontSizeValues')} />
+              <SimpleCheckbox checked={settings.showLineHeightValues} label="Интерлиньяж" onClick={() => toggleSetting('showLineHeightValues')} />
+              <SimpleCheckbox checked={settings.showLineHeightValues} label="Трекинг" onClick={() => toggleSetting('showLineHeightValues')} />
+              <SimpleCheckbox checked={settings.showLineHeightValues} label="Отступ абзаца" onClick={() => toggleSetting('showLineHeightValues')} isLast={true} />
             </AutoLayout>
             
             {/* Auto layout / Spacing group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
               <SimpleCheckbox checked={settings.showPaddingValues} label="Auto layout" onClick={() => toggleSetting('showPaddingValues')} isFirst={true} />
-              <SimpleCheckbox checked={settings.showItemSpacingValues} label="Spacing" onClick={() => toggleSetting('showItemSpacingValues')} />
-              <SimpleCheckbox checked={settings.showPaddingTopValues} label="Top" onClick={() => toggleSetting('showPaddingTopValues')} />
-              <SimpleCheckbox checked={settings.showPaddingRightValues} label="Right" onClick={() => toggleSetting('showPaddingRightValues')} />
-              <SimpleCheckbox checked={settings.showPaddingBottomValues} label="Bottom" onClick={() => toggleSetting('showPaddingBottomValues')} />
-              <SimpleCheckbox checked={settings.showPaddingLeftValues} label="Left" onClick={() => toggleSetting('showPaddingLeftValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showItemSpacingValues} label="Gap" onClick={() => toggleSetting('showItemSpacingValues')} />
+              <SimpleCheckbox checked={settings.showPaddingTopValues} label="Сверху" onClick={() => toggleSetting('showPaddingTopValues')} />
+              <SimpleCheckbox checked={settings.showPaddingRightValues} label="Справа" onClick={() => toggleSetting('showPaddingRightValues')} />
+              <SimpleCheckbox checked={settings.showPaddingBottomValues} label="Снизу" onClick={() => toggleSetting('showPaddingBottomValues')} />
+              <SimpleCheckbox checked={settings.showPaddingLeftValues} label="Слева" onClick={() => toggleSetting('showPaddingLeftValues')} isLast={true} />
             </AutoLayout>
             
             {/* Corner radius group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showAllCornersValues} label="Corner radius" onClick={() => toggleSetting('showAllCornersValues')} isFirst={true} />
-              <SimpleCheckbox checked={settings.showTopLeftRadiusValues} label="Top Left" onClick={() => toggleSetting('showTopLeftRadiusValues')} />
-              <SimpleCheckbox checked={settings.showTopRightRadiusValues} label="Top Right" onClick={() => toggleSetting('showTopRightRadiusValues')} />
-              <SimpleCheckbox checked={settings.showBottomLeftRadiusValues} label="Bottom Left" onClick={() => toggleSetting('showBottomLeftRadiusValues')} />
-              <SimpleCheckbox checked={settings.showBottomRightRadiusValues} label="Bottom Right" onClick={() => toggleSetting('showBottomRightRadiusValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showAllCornersValues} label="Радиус углов" onClick={() => toggleSetting('showAllCornersValues')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showTopLeftRadiusValues} label="Верх-лево" onClick={() => toggleSetting('showTopLeftRadiusValues')} />
+              <SimpleCheckbox checked={settings.showTopRightRadiusValues} label="Верх-право" onClick={() => toggleSetting('showTopRightRadiusValues')} />
+              <SimpleCheckbox checked={settings.showBottomLeftRadiusValues} label="Низ-лево" onClick={() => toggleSetting('showBottomLeftRadiusValues')} />
+              <SimpleCheckbox checked={settings.showBottomRightRadiusValues} label="Низ-право" onClick={() => toggleSetting('showBottomRightRadiusValues')} isLast={true} />
             </AutoLayout>
             
             {/* Effects group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showEffectValues} label="Effects" onClick={() => toggleSetting('showEffectValues')} isFirst={true} />
-              <SimpleCheckbox checked={settings.showEffectColorValues} label="Effect color" onClick={() => toggleSetting('showEffectColorValues')} />
-              <SimpleCheckbox checked={settings.showEffectValuesValues} label="Effect values" onClick={() => toggleSetting('showEffectValuesValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showEffectValues} label="Эффекты" onClick={() => toggleSetting('showEffectValues')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showEffectColorValues} label="Цвет эффекта" onClick={() => toggleSetting('showEffectColorValues')} />
+              <SimpleCheckbox checked={settings.showEffectValuesValues} label="Параметры эффекта" onClick={() => toggleSetting('showEffectValuesValues')} isLast={true} />
+            </AutoLayout>
+
+            {/* DS rules group */}
+            <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
+              <SimpleCheckbox checked={settings.showTokenMisuse} label="Правила ДС" onClick={() => toggleSetting('showTokenMisuse')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showRuleSpacingCategory !== false} label="Категория отступа" onClick={() => toggleSetting('showRuleSpacingCategory')} />
+              <SimpleCheckbox checked={settings.showRuleLayoutVocab !== false} label="Словарь layout/" onClick={() => toggleSetting('showRuleLayoutVocab')} />
+              <SimpleCheckbox checked={settings.showRuleRegionScope !== false} label="layout/page внутри" onClick={() => toggleSetting('showRuleRegionScope')} />
+              <SimpleCheckbox checked={settings.showRuleSemanticLayer !== false} label="Слой semantic" onClick={() => toggleSetting('showRuleSemanticLayer')} />
+              <SimpleCheckbox checked={settings.showRuleTierDiscipline !== false} label="Примитивы" onClick={() => toggleSetting('showRuleTierDiscipline')} />
+              <SimpleCheckbox checked={settings.showRuleDisabledLeaf !== false} label="*Disabled leaf" onClick={() => toggleSetting('showRuleDisabledLeaf')} />
+              <SimpleCheckbox checked={settings.showRuleComponentTier !== false} label="Component-tier" onClick={() => toggleSetting('showRuleComponentTier')} />
+              <SimpleCheckbox checked={settings.showRuleGradientStops !== false} label="Стопы градиентов" onClick={() => toggleSetting('showRuleGradientStops')} isLast={true} />
             </AutoLayout>
           </AutoLayout>
         )}
@@ -2438,10 +2488,10 @@ const ComponentTable = ({ components, displayedCount, settings }: {
       <AutoLayout direction="vertical" width="fill-parent" stroke="#eee" strokeWidth={1}>
 
         <AutoLayout direction="horizontal" spacing={0} padding={{ vertical: 8, horizontal: 12 }} width="fill-parent" stroke="#eee" strokeWidth={1}>
-          <AutoLayout width={260}><Text fontSize={11} fontWeight={600}>Component name</Text></AutoLayout>
-          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Description</Text></AutoLayout>
-          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Docs link</Text></AutoLayout>
-          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Variables</Text></AutoLayout>
+          <AutoLayout width={260}><Text fontSize={11} fontWeight={600}>Компонент</Text></AutoLayout>
+          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Описание</Text></AutoLayout>
+          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Ссылка</Text></AutoLayout>
+          <AutoLayout width={70} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">Переменные</Text></AutoLayout>
           <AutoLayout width={24} horizontalAlignItems="center"><Text fontSize={11} fontWeight={600} horizontalAlignText="center">&nbsp;</Text></AutoLayout>
         </AutoLayout>
       
@@ -2558,7 +2608,7 @@ const ComponentTable = ({ components, displayedCount, settings }: {
                           </AutoLayout>
                         )}
                         {safeComponent.isHiddenFromPublishing && (
-                          <Text fontSize={9} fill="#222">Hidden from publishing</Text>
+                          <Text fontSize={9} fill="#222">Скрыт из публикации</Text>
                         )}
                       </>
                     ) : (
@@ -2576,7 +2626,7 @@ const ComponentTable = ({ components, displayedCount, settings }: {
                           </Text>
                         </AutoLayout>
                         {safeComponent.isHiddenFromPublishing && (
-                          <Text fontSize={9} fill="#222">Hidden from publishing</Text>
+                          <Text fontSize={9} fill="#222">Скрыт из публикации</Text>
                         )}
                       </>
                     )}
@@ -2667,7 +2717,7 @@ const ComponentTable = ({ components, displayedCount, settings }: {
             console.error('Error rendering component:', safeComponent?.id || 'unknown', error)
             return (
               <AutoLayout key={`error-${index}`} direction="vertical" spacing={4} padding={8} fill="#FFEBEE" cornerRadius={4} width="fill-parent">
-                <Text fontSize={11} fill="#C62828">Error rendering component: {safeText(safeComponent?.name)}</Text>
+                <Text fontSize={11} fill="#C62828">Ошибка отображения компонента: {safeText(safeComponent?.name)}</Text>
               </AutoLayout>
             )
           }
@@ -2727,14 +2777,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             </Text>
           <AutoLayout direction="horizontal" spacing={12}>
               <Text fontSize={11} fill="#333333">
-                {`${safeText(stats.total)} ${stats.total === 1 ? 'variant' : 'variants'} (${safeText(stats.unique)} ${stats.unique === 1 ? 'component' : 'components'})`}
+                {`${safeText(stats.total)} вариант(ов) (${safeText(stats.unique)} комп.)`}
             </Text>
             </AutoLayout>
             <AutoLayout direction="horizontal" spacing={12}>
-              <Text fontSize={11} fill="#000" fontWeight={400}>{`Description: ${safeText(stats.withDescription)}`}</Text>
-              <Text fontSize={11} fill="#000" fontWeight={400}>{`Docs link: ${safeText(stats.withDocumentationLink)}`}</Text>
-              <Text fontSize={11} fill="#000" fontWeight={400}>{`Unbound values: ${safeText(stats.withUnboundProperties)}`}</Text>
-              <Text fontSize={11} fill="#000" fontWeight={400}>{`Hidden from publishing: ${safeText(stats.hidden)}`}</Text>
+              <Text fontSize={11} fill="#000" fontWeight={400}>{`Описание: ${safeText(stats.withDescription)}`}</Text>
+              <Text fontSize={11} fill="#000" fontWeight={400}>{`Ссылка: ${safeText(stats.withDocumentationLink)}`}</Text>
+              <Text fontSize={11} fill="#000" fontWeight={400}>{`Без переменных: ${safeText(stats.withUnboundProperties)}`}</Text>
+              <Text fontSize={11} fill="#000" fontWeight={400}>{`Скрыто: ${safeText(stats.hidden)}`}</Text>
           </AutoLayout>
         </AutoLayout>
       </AutoLayout>
@@ -2786,7 +2836,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             })}
             hoverStyle={{ fill: "#EFC8FD" }}
           >
-            <Text fontSize={10} fill="#8C00BA">{`Load ${safeText(Math.min(LOAD_MORE_SIZE, remaining))} more (${safeText(remaining)} remaining)`}</Text>
+            <Text fontSize={10} fill="#8C00BA">{`Показать ещё ${safeText(Math.min(LOAD_MORE_SIZE, remaining))} (осталось ${safeText(remaining)})`}</Text>
           </AutoLayout>
         )}
         
@@ -2802,7 +2852,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             })}
             hoverStyle={{ fill: "#EFC8FD" }}
           >
-            <Text fontSize={10} fill="#8C00BA">{`Load all (${safeText(totalCount)})`}</Text>
+            <Text fontSize={10} fill="#8C00BA">{`Показать все (${safeText(totalCount)})`}</Text>
           </AutoLayout>
         )}
         
@@ -2818,7 +2868,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             })}
             hoverStyle={{ fill: "#EFC8FD" }}
           >
-            <Text fontSize={10} fill="#8C00BA">{`Reset to ${safeText(CHUNK_SIZE)}`}</Text>
+            <Text fontSize={10} fill="#8C00BA">{`Свернуть до ${safeText(CHUNK_SIZE)}`}</Text>
           </AutoLayout>
         )}
       </AutoLayout>
@@ -2836,7 +2886,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     
     try {
       if (scanCurrentPageOnly) {
-        setCurrentProgress('Deep scanning current page...')
+        setCurrentProgress('Глубокий скан текущей страницы…')
         const currentPage = figma.currentPage
         const safeCurrentPageName = (currentPage.name || '').trim() || 'Current Page'
         
@@ -2866,10 +2916,10 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         
         setExpandedPages([safeCurrentPageName])
         setPageDisplayCounts({ [safeCurrentPageName]: CHUNK_SIZE })
-        setCurrentProgress(`Deep scan complete: Found ${pageComponents.length} components`)
+        setCurrentProgress(`Глубокий скан завершён: найдено ${pageComponents.length} комп.`)
         
       } else {
-        setCurrentProgress('Deep scanning all pages...')
+        setCurrentProgress('Глубокий скан всех страниц…')
         
         await figma.loadAllPagesAsync()
         const allPages = figma.root.children.filter(child => child.type === 'PAGE') as PageNode[]
@@ -2892,7 +2942,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           }
           
           try {
-            setCurrentProgress(`Deep scanning page ${i + 1}/${allPages.length}: ${safePage.name}`)
+            setCurrentProgress(`Скан страницы ${i + 1}/${allPages.length}: ${safePage.name}`)
             setPageProgress(prev => prev.map(p => 
               p.name === safePage.name 
                 ? { ...p, status: 'loading' }
@@ -2929,7 +2979,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           }
         }
 
-        setCurrentProgress(`Deep scan complete! Found ${allComponents.length} components across ${allPages.length} pages`)
+        setCurrentProgress(`Глубокий скан завершён! Найдено ${allComponents.length} комп. на ${allPages.length} страницах`)
       }
 
       setLastScanTime(new Date().toUTCString())
@@ -2941,7 +2991,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         
     } catch (error) {
       console.error('Error during deep scan:', error)
-      setCurrentProgress('Error occurred during deep scan')
+      setCurrentProgress('Ошибка при глубоком скане')
     } finally {
       setIsDeepScanning(false)
       setTimeout(() => {
@@ -2961,7 +3011,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     
     // Check if something is selected
     if (selection.length === 0) {
-      setSelectionError('Please select a component to scan')
+      setSelectionError('Выделите компонент для сканирования')
       return
     }
     
@@ -2983,7 +3033,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     })
     
     if (selectedComponents.length === 0) {
-      setSelectionError('No components found in selection')
+      setSelectionError('В выделении нет компонентов')
       return
     }
     
@@ -2993,7 +3043,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     setIsDeepScanning(true)
     setAuditData([])
     setPageProgress([])
-    setCurrentProgress(`Scanning ${selectedComponents.length} component${selectedComponents.length > 1 ? 's' : ''} from selection...`)
+    setCurrentProgress(`Сканирую ${selectedComponents.length} комп. из выделения…`)
     
     try {
       const currentPage = figma.currentPage
@@ -3068,7 +3118,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       
       setExpandedPages([safePageName])
       setPageDisplayCounts({ [safePageName]: SELECTION_CHUNK_SIZE })
-      setCurrentProgress(`Scan complete: Found ${selectedComponents.length} component${selectedComponents.length > 1 ? 's' : ''} in selection`)
+      setCurrentProgress(`Скан завершён: найдено ${selectedComponents.length} комп. в выделении`)
       setLastScanTime(new Date().toUTCString())
       
       // Auto-collapse the progress accordion after scan completes
@@ -3078,8 +3128,8 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       
     } catch (error) {
       console.error('Error scanning selection:', error)
-      figma.notify('❌ Error scanning selection', { error: true })
-      setCurrentProgress('Error occurred during scan')
+      figma.notify('❌ Ошибка сканирования выделения', { error: true })
+      setCurrentProgress('Ошибка при сканировании')
     } finally {
       setIsDeepScanning(false)
       // Clear page progress after a delay
@@ -3092,14 +3142,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
   const runDeepScanAllPages = async () => {
     try {
       // Step 1: Run quick scan first to ensure proper initialization
-      setCurrentProgress('Initializing: Running quick scan...')
+      setCurrentProgress('Инициализация: быстрый скан…')
       await runQuickScan()
       
       // Wait a moment for quick scan to complete
       await new Promise(resolve => setTimeout(resolve, 1000))
       
       // Step 2: Now run the deep scan
-      setCurrentProgress('Starting deep scan of all pages...')
+      setCurrentProgress('Старт глубокого скана всех страниц…')
       setCurrentPageOnly(false)
       await runDeepScanWithScope(false)
     } catch (error) {
@@ -3116,11 +3166,11 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         <AutoLayout direction="vertical" spacing={4} width="fill-parent">
           <AutoLayout direction="horizontal" spacing={4} width="fill-parent" verticalAlignItems="center">
             <Text fontSize={12} fontWeight={700}>🔍</Text>
-            <Text fontSize={16} fontWeight={700}>Component audit</Text>
+            <Text fontSize={16} fontWeight={700}>Аудит компонентов</Text>
           </AutoLayout>
           {!isQuickScanning && !isDeepScanning && auditData.length === 0 && (
             <Text fontSize={12} fill="#333" horizontalAlignText="center">
-              Choose a scan type to analyze your components.
+              Выберите тип сканирования для анализа компонентов.
             </Text>
           )}
       </AutoLayout>
@@ -3135,7 +3185,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               hoverStyle={{ fill: "#1565C0" }}
               width="hug-contents"
             >
-              <Text fontSize={10} fill="#FFFFFF">Rescan</Text>
+              <Text fontSize={10} fill="#FFFFFF">Пересканировать</Text>
             </AutoLayout>
             <AutoLayout 
               fill="#F44336"
@@ -3145,7 +3195,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               hoverStyle={{ fill: "#D32F2F" }}
               width="hug-contents"
             >
-              <Text fontSize={10} fill="#FFFFFF">Reset</Text>
+              <Text fontSize={10} fill="#FFFFFF">Сброс</Text>
             </AutoLayout>
           </AutoLayout>
         )}
@@ -3160,14 +3210,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           <AutoLayout direction="vertical" spacing={8} padding={12} fill="#FAECFF" stroke="#ECCBF8" strokeWidth={1} cornerRadius={16} width="fill-parent">
             <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
               <QuickScanIcon color="#8C00BA" size={16} />
-              <Text fontSize={12} fontWeight={600} fill="#8C00BA">Quick scan</Text>
+              <Text fontSize={12} fontWeight={600} fill="#8C00BA">Быстрый скан</Text>
             </AutoLayout>
             
             {!quickScanData ? (
               <>
                 <AutoLayout direction="vertical" spacing={4} width="fill-parent">
                   <Text fontSize={11} fill="#8C00BA" width="fill-parent">
-                    Fast overview of all components across your document. Shows counts, missing descriptions, and documentation links.
+                    Быстрый обзор всех компонентов документа: количество, отсутствующие описания и ссылки на документацию.
                   </Text>
                 </AutoLayout>
                 <AutoLayout 
@@ -3180,54 +3230,43 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
                   hoverStyle={{ fill: "#F6DFFE" }}
                   width="hug-contents"
                 >
-                  <Text fontSize={12} fill="#6D138B" fontWeight={600}>Start quick scan</Text>
+                  <Text fontSize={12} fill="#6D138B" fontWeight={600}>Запустить быстрый скан</Text>
                 </AutoLayout>
               </>
             ) : (
               <AutoLayout direction="vertical" spacing={8} width="fill-parent">
                 <AutoLayout direction="horizontal" spacing={4} width="fill-parent" wrap={true}>
-                  <Text fontSize={16} fill="#8C00BA">Out</Text>
-                  <Text fontSize={16} fill="#8C00BA">of</Text>
+                  <Text fontSize={16} fill="#8C00BA">Из</Text>
                   <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalPages)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">pages,</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">have</Text>
-                  <Text fontSize={16} fill="#8C00BA">components.</Text>
-                  <Text fontSize={16} fill="#8C00BA">We</Text>
-                  <Text fontSize={16} fill="#8C00BA">found</Text>
+                  <Text fontSize={16} fill="#8C00BA">страниц</Text>
+                  <Text fontSize={16} fill="#8C00BA">компоненты</Text>
+                  <Text fontSize={16} fill="#8C00BA">есть</Text>
+                  <Text fontSize={16} fill="#8C00BA">на</Text>
+                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}.</Text>
+                  <Text fontSize={16} fill="#8C00BA">Найдено</Text>
                   <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.uniqueComponents)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">unique</Text>
-                  <Text fontSize={16} fill="#8C00BA">components</Text>
-                  <Text fontSize={16} fill="#8C00BA">and</Text>
+                  <Text fontSize={16} fill="#8C00BA">уникальных</Text>
+                  <Text fontSize={16} fill="#8C00BA">компонентов</Text>
+                  <Text fontSize={16} fill="#8C00BA">и</Text>
                   <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalVariants)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">total</Text>
-                  <Text fontSize={16} fill="#8C00BA">variants.</Text>
-                  
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">components</Text>
-                  <Text fontSize={16} fill="#8C00BA">do</Text>
-                  <Text fontSize={16} fill="#8C00BA">not</Text>
-                  <Text fontSize={16} fill="#8C00BA">have</Text>
-                  <Text fontSize={16} fill="#8C00BA">a</Text>
-                  <Text fontSize={16} fill="#8C00BA">description</Text>
-                  <Text fontSize={16} fill="#8C00BA">set,</Text>
-                  <Text fontSize={16} fill="#8C00BA">and</Text>
-                  
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">components</Text>
-                  <Text fontSize={16} fill="#8C00BA">do</Text>
-                  <Text fontSize={16} fill="#8C00BA">not</Text>
-                  <Text fontSize={16} fill="#8C00BA">have</Text>
-                  <Text fontSize={16} fill="#8C00BA">a</Text>
-                  <Text fontSize={16} fill="#8C00BA">documentation</Text>
-                  <Text fontSize={16} fill="#8C00BA">link.</Text>
-                  
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">components</Text>
-                  <Text fontSize={16} fill="#8C00BA">are</Text>
-                  <Text fontSize={16} fill="#8C00BA">hidden</Text>
-                  <Text fontSize={16} fill="#8C00BA">from</Text>
-                  <Text fontSize={16} fill="#8C00BA">publishing.</Text>
+                  <Text fontSize={16} fill="#8C00BA">вариантов.</Text>
+
+                  <Text fontSize={16} fill="#8C00BA">Без</Text>
+                  <Text fontSize={16} fill="#8C00BA">описания</Text>
+                  <Text fontSize={16} fill="#8C00BA">—</Text>
+                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)},</Text>
+                  <Text fontSize={16} fill="#8C00BA">без</Text>
+                  <Text fontSize={16} fill="#8C00BA">ссылки</Text>
+                  <Text fontSize={16} fill="#8C00BA">на</Text>
+                  <Text fontSize={16} fill="#8C00BA">документацию</Text>
+                  <Text fontSize={16} fill="#8C00BA">—</Text>
+                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}.</Text>
+
+                  <Text fontSize={16} fill="#8C00BA">Скрыто</Text>
+                  <Text fontSize={16} fill="#8C00BA">из</Text>
+                  <Text fontSize={16} fill="#8C00BA">публикации</Text>
+                  <Text fontSize={16} fill="#8C00BA">—</Text>
+                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}.</Text>
                 </AutoLayout>
 
                 <AutoLayout direction="vertical" spacing={8} width="fill-parent">
@@ -3240,12 +3279,12 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
                     onClick={createSummaryFrame}
                     hoverStyle={{ fill: "#FCF5FF", stroke: "#8C00BA" }}
                   >
-                    <Text fontSize={12} fill="#69008C" fontWeight={600}>Add summary to canvas</Text>
+                    <Text fontSize={12} fill="#69008C" fontWeight={600}>Сводку на канвас</Text>
                   </AutoLayout>
 
                   {lastScanTime && (
                     <Text fontSize={11} fill="#8C00BA">
-                      {`Scanned at ${safeText(lastScanTime)}`}
+                      {`Скан: ${safeText(lastScanTime)}`}
                     </Text>
                   )}
                 </AutoLayout>
@@ -3258,10 +3297,10 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             <AutoLayout direction="vertical" spacing={4} width="fill-parent">
               <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
                 <SelectionIcon color="#2E7D32" size={16} />
-                <Text fontSize={12} fontWeight={600} fill="#2E7D32">Selection</Text>
+                <Text fontSize={12} fontWeight={600} fill="#2E7D32">Выделение</Text>
               </AutoLayout>
               <Text fontSize={11} fill="#2E7D32" width="fill-parent">
-                Detailed analysis of the currently selected component(s). Perfect for quick spot-checks.
+                Детальный анализ выделенных компонентов. Удобно для точечных проверок.
               </Text>
             </AutoLayout>
             
@@ -3281,7 +3320,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               hoverStyle={{ fill: "#E3FBE5" }}
               width="hug-contents"
             >
-              <Text fontSize={12} fill="#1B5E20" fontWeight={600}>Scan selection</Text>
+              <Text fontSize={12} fill="#1B5E20" fontWeight={600}>Сканировать выделение</Text>
             </AutoLayout>
           </AutoLayout>
 
@@ -3290,10 +3329,10 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             <AutoLayout direction="vertical" spacing={4} width="fill-parent">
               <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
                 <CurrentPageIcon color="#1976D2" size={16} />
-                <Text fontSize={12} fontWeight={600} fill="#1976D2">Current page</Text>
+                <Text fontSize={12} fontWeight={600} fill="#1976D2">Текущая страница</Text>
               </AutoLayout>
               <Text fontSize={11} fill="#1976D2" width="fill-parent">
-                Detailed analysis of components on the current page only. Includes unbound properties analysis.
+                Детальный анализ компонентов текущей страницы, включая непривязанные свойства.
               </Text>
             </AutoLayout>
             <AutoLayout 
@@ -3306,7 +3345,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               hoverStyle={{ fill: "#DFF0FE" }}
               width="hug-contents"
             >
-              <Text fontSize={12} fill="#0C4990" fontWeight={600}>Scan current page</Text>
+              <Text fontSize={12} fill="#0C4990" fontWeight={600}>Сканировать страницу</Text>
             </AutoLayout>
           </AutoLayout>
 
@@ -3315,10 +3354,10 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             <AutoLayout direction="vertical" spacing={4} width="fill-parent">
               <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
                 <EntireDocumentIcon color="#856404" size={16} />
-                <Text fontSize={12} fontWeight={600} fill="#856404">Whole file</Text>
+                <Text fontSize={12} fontWeight={600} fill="#856404">Весь файл</Text>
               </AutoLayout>
               <Text fontSize={11} fill="#856404" width="fill-parent">
-                Complete analysis of all components across every page. May be slow and could crash Figma with large documents.
+                Полный анализ всех компонентов на всех страницах. Может быть медленным; на больших файлах Figma может упасть.
               </Text>
             </AutoLayout>
             <AutoLayout 
@@ -3331,7 +3370,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               hoverStyle={{ fill: "#FEF4D2" }}
               width="hug-contents"
             >
-              <Text fontSize={12} fill="#5F4301" fontWeight={600}>Scan whole file</Text>
+              <Text fontSize={12} fill="#5F4301" fontWeight={600}>Сканировать весь файл</Text>
             </AutoLayout>
           </AutoLayout>
         </AutoLayout>
@@ -3350,12 +3389,12 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         <>
         <AutoLayout direction="vertical" spacing={2} width="fill-parent">
             <AutoLayout width="fill-parent">
-              <Text fontSize={14} fontWeight={600}>Deep analysis results</Text>
+              <Text fontSize={14} fontWeight={600}>Результаты глубокого анализа</Text>
             </AutoLayout>
             <AutoLayout width="fill-parent">
               {lastScanTime && (
                 <Text fontSize={11} fill="#333333">
-                  {`Scanned: ${safeText(lastScanTime)} (${currentPageOnly ? 'current page' : 'all pages'})`}
+                  {`Скан: ${safeText(lastScanTime)} (${currentPageOnly ? 'текущая страница' : 'все страницы'})`}
         </Text>
       )}
             </AutoLayout>
@@ -3376,7 +3415,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
               ) : (
                 <ChevronRightIcon color="#333333" size={14} />
               )}
-              <Text fontSize={12} fontWeight={600} fill="#333333">Settings</Text>
+              <Text fontSize={12} fontWeight={600} fill="#333333">Настройки</Text>
             </AutoLayout>
             
             {isSettingsExpanded && (
@@ -3402,7 +3441,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             onClick={() => toggleAllPages(true)}
                 hoverStyle={{ fill: "#ddd" }}
           >
-                <Text fontSize={10} fill="#333333">Expand all pages (Figma may crash!)</Text>
+                <Text fontSize={10} fill="#333333">Развернуть все страницы (Figma может упасть!)</Text>
           </AutoLayout>
           <AutoLayout 
                 fill="#eee" 
@@ -3411,7 +3450,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             onClick={() => toggleAllPages(false)}
                 hoverStyle={{ fill: "#ddd" }}
           >
-                <Text fontSize={10} fill="#333333">Collapse all pages</Text>
+                <Text fontSize={10} fill="#333333">Свернуть все страницы</Text>
           </AutoLayout>
         </AutoLayout>
       )}
