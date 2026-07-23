@@ -20,7 +20,7 @@ const safeText = (value: any): string => {
 }
 
 interface UnboundProperty {
-  type: 'fill' | 'stroke' | 'text' | 'cornerRadius' | 'spacing' | 'effect' | 'appearance'
+  type: 'fill' | 'stroke' | 'text' | 'cornerRadius' | 'spacing' | 'effect' | 'appearance' | 'tokenMisuse'
   property: string
   currentValue?: string
   nodePath?: string
@@ -66,6 +66,211 @@ interface QuickScanData {
   withoutDocs: number
   totalUnboundProperties: number
   hiddenComponents: number
+}
+
+// ============================================================================
+// DS token semantic-fit checks (Genlab DS rules v1.3.0, docs/rules/tokens/*)
+// Beyond "bound or not": verifies a bound variable is the RIGHT token for the
+// property it is bound to. Rule ids reference docs/rules in the DS repo.
+// ============================================================================
+
+interface ResolvedVar {
+  name: string        // variable name, e.g. "layout/container/padding/vertical"
+  collection: string  // collection name, e.g. "semantic" / "device" / "primitive"
+}
+
+// Variable ids repeat heavily across components — resolve each id once per session.
+const dsVarCache = new Map<string, ResolvedVar | null>()
+
+const resolveBoundVar = async (id: string): Promise<ResolvedVar | null> => {
+  if (dsVarCache.has(id)) return dsVarCache.get(id) || null
+  let resolved: ResolvedVar | null = null
+  try {
+    const v = await figma.variables.getVariableByIdAsync(id)
+    if (v) {
+      let collection = ''
+      try {
+        const c = await figma.variables.getVariableCollectionByIdAsync(v.variableCollectionId)
+        if (c) collection = c.name
+      } catch (e) {
+        // Remote (library) collections may not resolve — variable name alone still usable
+      }
+      resolved = { name: v.name, collection }
+    }
+  } catch (e) {
+    // Unresolvable id — treat as unknown, never crash the scan
+  }
+  dsVarCache.set(id, resolved)
+  return resolved
+}
+
+// Component-slug registry for tokens-no-component-tier (DEC-014): a token middle
+// segment must not repeat a component name. Built from component sets in scanned pages.
+let dsComponentSlugs = new Set<string>()
+
+const buildSlugRegistry = (pages: PageNode[]) => {
+  dsComponentSlugs = new Set<string>()
+  pages.forEach(page => {
+    const sets = page.findAll(n => n.type === 'COMPONENT_SET')
+    sets.forEach(set => {
+      const slug = (set.name || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase()
+      if (slug) dsComponentSlugs.add(slug)
+    })
+  })
+}
+
+const DS_GAP_PROPS = ['itemSpacing', 'counterAxisSpacing', 'gap']
+const DS_PADDING_PROPS = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft']
+const DS_SPACING_PROP_LABELS: Record<string, string> = {
+  itemSpacing: 'Item Spacing',
+  counterAxisSpacing: 'Counter Axis Spacing',
+  gap: 'Gap',
+  paddingTop: 'Padding Top',
+  paddingRight: 'Padding Right',
+  paddingBottom: 'Padding Bottom',
+  paddingLeft: 'Padding Left'
+}
+// Closed layout/ vocabulary (spacing-layout-vocabulary, rules v1.3.0)
+const DS_LAYOUT_VOCAB = /^layout\/(page\/margin\/(horizontal|vertical)|container\/padding\/(horizontal|vertical)|content\/gap\/(horizontal|vertical)|grid\/gutter)$/
+
+const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]> => {
+  const findings: UnboundProperty[] = []
+
+  const report = (node: SceneNode, path: string, property: string, message: string) => {
+    findings.push({
+      type: 'tokenMisuse',
+      property,
+      currentValue: safeText(message),
+      nodePath: safeText(path),
+      nodeId: node.id
+    })
+  }
+
+  // Checks that apply to ANY bound variable regardless of the property
+  const checkUniversal = (node: SceneNode, path: string, propLabel: string, v: ResolvedVar) => {
+    const collection = (v.collection || '').toLowerCase()
+
+    // spacing-bind-semantic-layer (hard): device collection is a hidden engine —
+    // bind the semantic layer. Exceptions by design: visible/* booleans, system/device.
+    if (collection === 'device' && !v.name.startsWith('visible/') && v.name !== 'system/device') {
+      report(node, path, propLabel, `"${v.name}" bound from "device" collection — bind the "semantic" layer instead (spacing-bind-semantic-layer)`)
+    }
+
+    // Tier discipline: components bind semantic tokens, not primitives directly
+    if (collection.startsWith('primitive') || v.name.startsWith('primitive/')) {
+      report(node, path, propLabel, `"${v.name}" is a primitive-tier token — bind a semantic token instead (tier-discipline)`)
+    }
+
+    // tokens-no-disabled-suffix-leaf (DEC-024, hard): <word>Disabled leafs are banned —
+    // disabled is implemented via opacity/disabled overlay (DEC-023)
+    const leaf = v.name.split('/').pop() || ''
+    if (/^[a-zA-Z]+Disabled$/.test(leaf)) {
+      report(node, path, propLabel, `"${v.name}" uses banned <word>Disabled leaf — use opacity/disabled overlay (tokens-no-disabled-suffix-leaf, DEC-024)`)
+    }
+
+    // tokens-no-component-tier (DEC-014, soft): middle segment must not repeat a component slug
+    const segments = v.name.split('/')
+    const middles = segments.slice(1, -1)
+    const hit = middles.find(seg => dsComponentSlugs.has(seg.toLowerCase()))
+    if (hit) {
+      report(node, path, propLabel, `"${v.name}" middle segment "${hit}" matches a component name — tokens must be role/category-tier (tokens-no-component-tier, DEC-014)`)
+    }
+  }
+
+  const walk = async (node: SceneNode, parentPath: string): Promise<void> => {
+    const safeName = safeText(node.name) !== 'N/A' ? safeText(node.name) : (node.type || 'Node')
+    const path = parentPath ? `${parentPath} > ${safeName}` : safeName
+    const bv: any = (node as any).boundVariables
+
+    if (bv) {
+      // --- Spacing props: category and region rules ---
+      for (const key of [...DS_GAP_PROPS, ...DS_PADDING_PROPS]) {
+        const alias = bv[key]
+        if (alias && alias.type === 'VARIABLE_ALIAS') {
+          const v = await resolveBoundVar(alias.id)
+          if (!v) continue
+          const label = DS_SPACING_PROP_LABELS[key] || key
+          checkUniversal(node, path, label, v)
+
+          const isGapProp = DS_GAP_PROPS.indexOf(key) !== -1
+
+          // spacing-category-property-match (hard): token category must match property category
+          if (isGapProp && /(^|\/)(padding|margin)\//.test(v.name)) {
+            report(node, path, label, `bound to "${v.name}" — gap properties take */gap/* tokens only (spacing-category-property-match)`)
+          }
+          if (!isGapProp && /(^|\/)gap\//.test(v.name)) {
+            report(node, path, label, `bound to "${v.name}" — padding properties take */padding/* or */margin/* tokens only (spacing-category-property-match)`)
+          }
+
+          // spacing-layout-vocabulary (hard): layout/ names come from the closed vocabulary
+          if (v.name.startsWith('layout/') && !DS_LAYOUT_VOCAB.test(v.name)) {
+            report(node, path, label, `bound to "${v.name}" — not in the layout/ vocabulary (layout/{page/margin|container/padding|content/gap}/{axis}, layout/grid/gutter) (spacing-layout-vocabulary)`)
+          }
+
+          // spacing-region-scope: page-frame tokens inside components are legal only for
+          // positioning a fullscreen overlay against the viewport — review any other use
+          if (v.name.startsWith('layout/page/')) {
+            report(node, path, label, `bound to "${v.name}" — page-scope token inside a component; legal only for fullscreen-overlay viewport positioning, review (spacing-region-scope)`)
+          }
+        }
+      }
+
+      // --- Color/other bindings: universal token checks ---
+      for (const arrKey of ['fills', 'strokes']) {
+        const arr = bv[arrKey]
+        if (Array.isArray(arr)) {
+          for (const alias of arr) {
+            if (alias && alias.type === 'VARIABLE_ALIAS') {
+              const v = await resolveBoundVar(alias.id)
+              if (v) checkUniversal(node, path, arrKey === 'fills' ? 'Fill' : 'Stroke Color', v)
+            }
+          }
+        }
+      }
+      for (const key of ['cornerRadius', 'topLeftRadius', 'topRightRadius', 'bottomLeftRadius', 'bottomRightRadius', 'strokeWeight', 'opacity']) {
+        const alias = bv[key]
+        if (alias && alias.type === 'VARIABLE_ALIAS') {
+          const v = await resolveBoundVar(alias.id)
+          if (v) checkUniversal(node, path, key, v)
+        }
+      }
+    }
+
+    // --- Gradient stops (DEC-036): every stop color must be bound to a color/gradient/* variable ---
+    for (const paintKey of ['fills', 'strokes']) {
+      if (paintKey in node) {
+        const paints = (node as any)[paintKey]
+        if (paints && paints !== figma.mixed && Array.isArray(paints)) {
+          paints.forEach((paint: any, pi: number) => {
+            if (paint.visible === false) return
+            if (typeof paint.type === 'string' && paint.type.indexOf('GRADIENT_') === 0) {
+              const stops = paint.gradientStops || []
+              stops.forEach((stop: any, si: number) => {
+                const bound = stop.boundVariables && stop.boundVariables.color &&
+                              stop.boundVariables.color.type === 'VARIABLE_ALIAS'
+                if (!bound) {
+                  report(node, path, `Gradient ${pi + 1} stop ${si + 1}`, `stop color not bound to a color/gradient/* variable (gradient-stop-unbound, DEC-036)`)
+                }
+              })
+            }
+          })
+        }
+      }
+    }
+
+    if ('children' in node && node.children) {
+      for (const child of node.children) {
+        await walk(child, path)
+      }
+    }
+  }
+
+  try {
+    await walk(root, '')
+  } catch (e) {
+    console.error('Error in checkTokenMisuse:', e)
+  }
+  return findings
 }
 
 const XIcon = ({ color = "#F44336", size = 16 }: { color?: string, size?: number }) => (
@@ -219,6 +424,7 @@ interface SettingsState {
   showMissingDescription: boolean
   showMissingDocsLink: boolean
   showMissingVariables: boolean
+  showTokenMisuse: boolean
   hideZeroValues: boolean
   showFillValues: boolean
   // Stroke group
@@ -268,6 +474,7 @@ function Widget() {
     showMissingDescription: true,
     showMissingDocsLink: true,
     showMissingVariables: true,
+    showTokenMisuse: true,
     hideZeroValues: true,
     showFillValues: true,
     // Stroke group
@@ -560,12 +767,20 @@ function Widget() {
           });
         } else if (typeof node.cornerRadius === 'number' && node.cornerRadius >= 0) {
           // Unified corner radius (all corners same, no individual properties)
-          const hasUnifiedCornerVar = node.boundVariables && 
+          const hasUnifiedCornerVar = node.boundVariables &&
                                      node.boundVariables['cornerRadius' as keyof typeof node.boundVariables] &&
                                      typeof node.boundVariables['cornerRadius' as keyof typeof node.boundVariables] === 'object' &&
                                      (node.boundVariables['cornerRadius' as keyof typeof node.boundVariables] as any).type === 'VARIABLE_ALIAS';
-          
-          if (!hasUnifiedCornerVar) {
+
+          // Equal per-corner values keep cornerRadius as a plain number while the
+          // binding lives on the individual corner keys — not a violation then
+          const allCornersIndividuallyBound = ['topLeftRadius', 'topRightRadius', 'bottomLeftRadius', 'bottomRightRadius']
+            .every(k => {
+              const b = node.boundVariables && (node.boundVariables as any)[k];
+              return b && typeof b === 'object' && b.type === 'VARIABLE_ALIAS';
+            });
+
+          if (!hasUnifiedCornerVar && !allCornersIndividuallyBound) {
             unboundProperties.push({
               type: 'cornerRadius',
               property: 'All Corners',
@@ -901,17 +1116,17 @@ function Widget() {
     }))
   }
 
-  const processPageComponents = (page: PageNode): ComponentAuditData[] => {
+  const processPageComponents = async (page: PageNode): Promise<ComponentAuditData[]> => {
     const components = page.findAll(node => node.type === 'COMPONENT') as ComponentNode[]
     const componentSets = page.findAll(node => node.type === 'COMPONENT_SET') as ComponentSetNode[]
     const safePageName = (page.name || '').trim() || 'Unnamed Page'
     const currentPageName = (figma.currentPage.name || '').trim() || 'Current Page'
-    
+
     const result: ComponentAuditData[] = []
     const processedComponentSets = new Set<string>()
-    
+
     // First, process all individual components and identify component sets
-    components.forEach(component => {
+    for (const component of components) {
       let componentSetName: string | undefined
       let variantProperties: Record<string, string> | undefined
       let displayName = (component.name || '').trim() || 'Unnamed Component'
@@ -962,6 +1177,8 @@ function Widget() {
       }
 
       const unboundCheck = checkForUnboundProperties(component)
+      const misuseFindings = await checkTokenMisuse(component)
+      const allProperties = [...unboundCheck.properties, ...misuseFindings]
 
       // Add individual component/variant entry
       result.push({
@@ -972,14 +1189,14 @@ function Widget() {
         pageName: safePageName,
         hasDescription: hasDescription(component),
         hasDocumentationLink: hasDocumentationLink(component),
-        hasUnboundProperties: unboundCheck.hasUnbound,
-        unboundProperties: unboundCheck.properties,
+        hasUnboundProperties: allProperties.length > 0,
+        unboundProperties: allProperties,
         isHiddenFromPublishing: isHiddenFromPublishing(componentSetName || displayName),
         isOnCurrentPage: safePageName === currentPageName,
         isVariant
       })
-    })
-    
+    }
+
     // Post-process to determine which component sets should be expandable
     // A component set is expandable if any of its variants have unbound properties
     const componentSetExpandability = new Map<string, boolean>()
@@ -1394,6 +1611,9 @@ function Widget() {
         case 'appearance':
           shouldShow = settings.showAppearanceValues
           break
+        case 'tokenMisuse':
+          shouldShow = settings.showTokenMisuse
+          break
         default:
           shouldShow = true
       }
@@ -1417,9 +1637,10 @@ function Widget() {
 
   const shouldShowComponent = (component: ComponentAuditData): boolean => {
     // Check if any filters are active
-    const hasActiveFilters = settings.showMissingDescription || 
-                             settings.showMissingDocsLink || 
-                             settings.showMissingVariables
+    const hasActiveFilters = settings.showMissingDescription ||
+                             settings.showMissingDocsLink ||
+                             settings.showMissingVariables ||
+                             settings.showTokenMisuse
     
     // If no filters are active, show nothing
     if (!hasActiveFilters) {
@@ -1451,7 +1672,11 @@ function Widget() {
         }
       }
     }
-    
+
+    if (settings.showTokenMisuse && component.unboundProperties.some(p => p.type === 'tokenMisuse')) {
+      matchesFilter = true
+    }
+
     return matchesFilter
   }
 
@@ -1537,6 +1762,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showMissingDescription: true,
       showMissingDocsLink: true,
       showMissingVariables: true,
+      showTokenMisuse: true,
       hideZeroValues: true,
       showFillValues: true,
       // Stroke group
@@ -1807,6 +2033,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       spacing: '📏 Spacing',
       effect: '✨ Effects',
       appearance: '👁️ Appearance',
+      tokenMisuse: '🚨 DS Rule Violations',
       unknown: '❓ Unknown Type'
     }
 
@@ -2087,10 +2314,15 @@ const SettingsPanel = ({
           label="Documentation link" 
           onClick={() => toggleSetting('showMissingDocsLink')}
         />
-        <SimpleCheckbox 
-          checked={settings.showMissingVariables} 
-          label="Variables" 
+        <SimpleCheckbox
+          checked={settings.showMissingVariables}
+          label="Variables"
           onClick={() => toggleSetting('showMissingVariables')}
+        />
+        <SimpleCheckbox
+          checked={settings.showTokenMisuse}
+          label="DS rules"
+          onClick={() => toggleSetting('showTokenMisuse')}
           isLast={true}
         />
       </AutoLayout>
@@ -2614,8 +2846,9 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           componentCount: 0
         }])
 
-        const pageComponents = processPageComponents(currentPage)
-        
+        buildSlugRegistry([currentPage])
+        const pageComponents = await processPageComponents(currentPage)
+
         setPageProgress([{
           name: safeCurrentPageName,
           status: 'complete',
@@ -2647,6 +2880,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           componentCount: 0
         }))
         setPageProgress(initialProgress)
+        buildSlugRegistry(allPages)
 
         let allComponents: ComponentAuditData[] = []
         
@@ -2665,7 +2899,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
                 : p
             ))
 
-            const pageComponents = processPageComponents(page)
+            const pageComponents = await processPageComponents(page)
             allComponents = [...allComponents, ...pageComponents]
             
             setPageProgress(prev => prev.map(p => 
@@ -2773,9 +3007,11 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       
       const processedComponentSets = new Set<string>()
       const result: ComponentAuditData[] = []
-      
+
+      buildSlugRegistry([currentPage])
+
       // Process each selected component
-      selectedComponents.forEach(component => {
+      for (const component of selectedComponents) {
         let componentSetName: string | undefined
         let variantProperties: Record<string, string> | undefined
         let displayName = (component.name || '').trim() || 'Unnamed Component'
@@ -2795,6 +3031,8 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         }
 
         const unboundCheck = checkForUnboundProperties(component)
+        const misuseFindings = await checkTokenMisuse(component)
+        const allProperties = [...unboundCheck.properties, ...misuseFindings]
 
         result.push({
           id: component.id,
@@ -2804,15 +3042,15 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           pageName: safePageName,
           hasDescription: hasDescription(component),
           hasDocumentationLink: hasDocumentationLink(component),
-          hasUnboundProperties: unboundCheck.hasUnbound,
-          unboundProperties: unboundCheck.properties,
+          hasUnboundProperties: allProperties.length > 0,
+          unboundProperties: allProperties,
           isHiddenFromPublishing: isHiddenFromPublishing(componentSetName || displayName),
           isOnCurrentPage: true,
           isVariant,
-          hasExpandableContent: unboundCheck.hasUnbound
+          hasExpandableContent: allProperties.length > 0
         })
-      })
-      
+      }
+
       setPageProgress([{
         name: safePageName,
         status: 'complete',
