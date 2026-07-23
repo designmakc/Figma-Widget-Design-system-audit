@@ -26,6 +26,7 @@ interface UnboundProperty {
   nodePath?: string
   nodeId?: string  // Store the actual node ID for direct navigation
   ruleId?: string  // DS rule id for tokenMisuse findings (per-rule settings filter)
+  fixRename?: string  // auto-fix: rename target node to this value
 }
 
 interface ComponentAuditData {
@@ -141,7 +142,6 @@ const DS_RULE_SETTINGS: Record<string, string> = {
   'spacing-region-scope': 'showRuleRegionScope',
   'spacing-bind-semantic-layer': 'showRuleSemanticLayer',
   'tier-discipline': 'showRuleTierDiscipline',
-  'tokens-no-disabled-suffix-leaf': 'showRuleDisabledLeaf',
   'tokens-no-component-tier': 'showRuleComponentTier',
   'gradient-stop-unbound': 'showRuleGradientStops',
   'component-name-pascalcase': 'showRuleComponentName',
@@ -181,12 +181,8 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
       report(node, path, propLabel, 'tier-discipline', `«${v.name}» — primitive-токен, биндить semantic-уровень (tier-discipline)`)
     }
 
-    // tokens-no-disabled-suffix-leaf (DEC-024, hard): <word>Disabled leafs are banned —
-    // disabled is implemented via opacity/disabled overlay (DEC-023)
-    const leaf = v.name.split('/').pop() || ''
-    if (/^[a-zA-Z]+Disabled$/.test(leaf)) {
-      report(node, path, propLabel, 'tokens-no-disabled-suffix-leaf', `«${v.name}» — запрещённый leaf <word>Disabled; disabled делается через opacity/disabled overlay (tokens-no-disabled-suffix-leaf, DEC-024)`)
-    }
+    // DEC-024 (tokens-no-disabled-suffix-leaf) RETIRED 2026-07-23: disabled-токены
+    // цвета легальны наравне с opacity/disabled overlay — проверка снята.
 
     // tokens-no-component-tier (DEC-014, soft): middle segment must not repeat a component slug
     const segments = v.name.split('/')
@@ -303,6 +299,21 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
 
 const DS_PASCAL = /^[A-Z][a-zA-Z0-9]*$/
 const DS_CAMEL = /^[a-z][a-zA-Z0-9]*$/
+
+// "Progress bar" → "progressBar"; ALL-CAPS words are lowercased first
+const dsNormWord = (w: string): string => (w.length > 1 && w === w.toUpperCase() ? w.toLowerCase() : w)
+const dsToCamelCase = (s: string): string => {
+  const words = s.trim().split(/[^a-zA-Z0-9]+/).filter(Boolean).map(dsNormWord)
+  if (words.length === 0) return s
+  return words.map((w, i) => i === 0
+    ? w.charAt(0).toLowerCase() + w.slice(1)
+    : w.charAt(0).toUpperCase() + w.slice(1)).join('')
+}
+const dsToPascalCase = (s: string): string => {
+  const words = s.trim().split(/[^a-zA-Z0-9]+/).filter(Boolean).map(dsNormWord)
+  if (words.length === 0) return s
+  return words.map(w => w.charAt(0).toUpperCase() + w.slice(1)).join('')
+}
 // Tier-1 glossary anti-names → canonical axis name (DEC-025).
 // 'position' intentionally absent: legit Tier-2 axis (e.g. corneroverlay).
 const DS_GLOSSARY_ANTINAMES: Record<string, string> = {
@@ -335,8 +346,10 @@ const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundPr
 
   // component-name-pascalcase (DEC-032, hard)
   if (name && !DS_PASCAL.test(name)) {
-    findings.push(dsNamingFinding(root, 'Имя компонента', 'component-name-pascalcase',
-      `«${name}» — имя компонента должно быть PascalCase слитно, без пробелов/дефисов/подчёркиваний (component-name-pascalcase, DEC-032)`))
+    const finding = dsNamingFinding(root, 'Имя компонента', 'component-name-pascalcase',
+      `«${name}» — имя компонента должно быть PascalCase слитно, без пробелов/дефисов/подчёркиваний (component-name-pascalcase, DEC-032)`)
+    finding.fixRename = dsToPascalCase(name)
+    findings.push(finding)
   }
 
   let defs: any = null
@@ -415,7 +428,8 @@ const checkLayerNaming = (root: ComponentNode): UnboundProperty[] => {
           currentValue: safeText(`«${childName}» — имя слоя должно быть camelCase (layer-naming-camelcase, DEC-008)`),
           nodePath: safeText(path ? `${path} > ${childName}` : childName),
           nodeId: child.id,
-          ruleId: 'layer-naming-camelcase'
+          ruleId: 'layer-naming-camelcase',
+          fixRename: dsToCamelCase(childName)
         })
       }
       walk(child, path ? `${path} > ${childName}` : childName)
@@ -588,7 +602,6 @@ interface SettingsState {
   showRuleRegionScope: boolean
   showRuleSemanticLayer: boolean
   showRuleTierDiscipline: boolean
-  showRuleDisabledLeaf: boolean
   showRuleComponentTier: boolean
   showRuleGradientStops: boolean
   showRuleComponentName: boolean
@@ -651,7 +664,6 @@ function Widget() {
     showRuleRegionScope: true,
     showRuleSemanticLayer: true,
     showRuleTierDiscipline: true,
-    showRuleDisabledLeaf: true,
     showRuleComponentTier: true,
     showRuleGradientStops: true,
     showRuleComponentName: true,
@@ -688,9 +700,46 @@ function Widget() {
     showAppearanceValues: false
   })
 
+  // Ignored findings: stable keys, survive rescans (synced state)
+  const [ignoredFindings, setIgnoredFindings] = useSyncedState<string[]>('ignoredFindings', [])
+
   const CHUNK_SIZE = 25
   const LOAD_MORE_SIZE = 25
   const SELECTION_CHUNK_SIZE = 50  // Larger initial load for selection scans
+
+  const findingKey = (prop: UnboundProperty): string =>
+    [prop.nodeId || '', prop.ruleId || prop.type, prop.property, prop.currentValue || ''].join('|')
+
+  const toggleIgnoreFinding = (prop: UnboundProperty) => {
+    const key = findingKey(prop)
+    if (ignoredFindings.indexOf(key) === -1) {
+      setIgnoredFindings([...ignoredFindings, key])
+    } else {
+      setIgnoredFindings(ignoredFindings.filter(k => k !== key))
+    }
+  }
+
+  const applyFixRename = async (componentId: string, prop: UnboundProperty) => {
+    if (!prop.fixRename || !prop.nodeId) return
+    try {
+      const node = await figma.getNodeByIdAsync(prop.nodeId)
+      if (!node) {
+        figma.notify('❌ Узел не найден — пересканируйте')
+        return
+      }
+      node.name = prop.fixRename
+      const key = findingKey(prop)
+      setAuditData(auditData.map(c => {
+        const rest = c.unboundProperties.filter(p => findingKey(p) !== key)
+        if (rest.length === c.unboundProperties.length) return c
+        return { ...c, unboundProperties: rest, hasUnboundProperties: rest.length > 0 }
+      }))
+      figma.notify(`✅ Переименовано: «${prop.fixRename}»`)
+    } catch (e) {
+      console.error('Error applying fix:', e)
+      figma.notify('❌ Не удалось переименовать (узел заблокирован?)', { error: true })
+    }
+  }
 
   const getNodePath = (node: SceneNode, rootNode: SceneNode): string => {
     const path: string[] = []
@@ -1717,6 +1766,11 @@ function Widget() {
 
   const filterUnboundPropertiesWithZeroValues = (properties: UnboundProperty[]): UnboundProperty[] => {
     return properties.filter(prop => {
+      // Ignored by user — hidden everywhere (counters, rows, component filter)
+      if (ignoredFindings.length > 0 && ignoredFindings.indexOf(findingKey(prop)) !== -1) {
+        return false
+      }
+
       // Granular filtering based on property type and property name
       let shouldShow = false
       
@@ -1965,7 +2019,6 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showRuleRegionScope: true,
       showRuleSemanticLayer: true,
       showRuleTierDiscipline: true,
-      showRuleDisabledLeaf: true,
       showRuleComponentTier: true,
       showRuleGradientStops: true,
       showRuleComponentName: true,
@@ -2275,6 +2328,30 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                         <Text fontSize={11} fill="#6A0000" width="fill-parent">{safeCurrentValue}</Text>
                       </AutoLayout>
                     </AutoLayout>
+                    {prop.fixRename && (
+                      <AutoLayout
+                        padding={{ vertical: 3, horizontal: 7 }}
+                        fill="#FFE2C4"
+                        stroke="#E8A968"
+                        strokeWidth={1}
+                        cornerRadius={6}
+                        onClick={() => applyFixRename(componentId, prop)}
+                        hoverStyle={{ fill: "#FFD199" }}
+                      >
+                        <Text fontSize={10} fill="#7A3E00" fontWeight={600}>Исправить</Text>
+                      </AutoLayout>
+                    )}
+                    <AutoLayout
+                      padding={{ vertical: 3, horizontal: 7 }}
+                      fill="#EFEFEF"
+                      stroke="#D5D5D5"
+                      strokeWidth={1}
+                      cornerRadius={6}
+                      onClick={() => toggleIgnoreFinding(prop)}
+                      hoverStyle={{ fill: "#E0E0E0" }}
+                    >
+                      <Text fontSize={10} fill="#555555" fontWeight={600}>Игнор</Text>
+                    </AutoLayout>
                     {isOnCurrentPage && (
                       <AutoLayout width={20} height={20} horizontalAlignItems="center" verticalAlignItems="center">
                         <ExternalLinkIcon color="#6A0000" size={12} />
@@ -2299,16 +2376,20 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     }
   }
 
-const SettingsPanel = ({ 
-  settings, 
+const SettingsPanel = ({
+  settings,
   setSettings,
   isIndividualPropsExpanded,
-  setIsIndividualPropsExpanded
-}: { 
-  settings: SettingsState, 
+  setIsIndividualPropsExpanded,
+  ignoredCount,
+  onResetIgnores
+}: {
+  settings: SettingsState,
   setSettings: (settings: SettingsState) => void,
   isIndividualPropsExpanded: boolean,
-  setIsIndividualPropsExpanded: (value: boolean) => void
+  setIsIndividualPropsExpanded: (value: boolean) => void,
+  ignoredCount: number,
+  onResetIgnores: () => void
 }) => {
   const toggleSetting = (key: keyof SettingsState) => {
     const newValue = !settings[key]
@@ -2525,6 +2606,21 @@ const SettingsPanel = ({
           isLast={true}
         />
       </AutoLayout>
+
+      {ignoredCount > 0 && (
+        <AutoLayout
+          padding={{ vertical: 4, horizontal: 8 }}
+          fill="#EFEFEF"
+          stroke="#D5D5D5"
+          strokeWidth={1}
+          cornerRadius={8}
+          onClick={onResetIgnores}
+          hoverStyle={{ fill: "#E0E0E0" }}
+          width="hug-contents"
+        >
+          <Text fontSize={10} fill="#555555" fontWeight={600}>{`Сбросить игноры (${safeText(ignoredCount)})`}</Text>
+        </AutoLayout>
+      )}
       
       {/* Individual properties collapsible section */}
       <AutoLayout direction="vertical" spacing={8} width="fill-parent">
@@ -2617,7 +2713,6 @@ const SettingsPanel = ({
               <SimpleCheckbox checked={settings.showRuleRegionScope !== false} label="layout/page внутри" onClick={() => toggleSetting('showRuleRegionScope')} />
               <SimpleCheckbox checked={settings.showRuleSemanticLayer !== false} label="Слой semantic" onClick={() => toggleSetting('showRuleSemanticLayer')} />
               <SimpleCheckbox checked={settings.showRuleTierDiscipline !== false} label="Примитивы" onClick={() => toggleSetting('showRuleTierDiscipline')} />
-              <SimpleCheckbox checked={settings.showRuleDisabledLeaf !== false} label="*Disabled leaf" onClick={() => toggleSetting('showRuleDisabledLeaf')} />
               <SimpleCheckbox checked={settings.showRuleComponentTier !== false} label="Component-tier" onClick={() => toggleSetting('showRuleComponentTier')} />
               <SimpleCheckbox checked={settings.showRuleGradientStops !== false} label="Стопы градиентов" onClick={() => toggleSetting('showRuleGradientStops')} isLast={true} />
             </AutoLayout>
@@ -3601,11 +3696,13 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             </AutoLayout>
             
             {isSettingsExpanded && (
-              <SettingsPanel 
-                settings={settings} 
+              <SettingsPanel
+                settings={settings}
                 setSettings={setSettings}
                 isIndividualPropsExpanded={isIndividualPropsExpanded}
                 setIsIndividualPropsExpanded={setIsIndividualPropsExpanded}
+                ignoredCount={ignoredFindings.length}
+                onResetIgnores={() => setIgnoredFindings([])}
               />
             )}
           </AutoLayout>

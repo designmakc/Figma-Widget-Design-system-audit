@@ -4,6 +4,8 @@
 
 Все находки DS-правил выводятся в группе «🚨 Нарушения правил ДС» с `ruleId`; каждое правило отключается тумблером в Настройки → Отдельные свойства.
 
+**Действия на находке:** «Игнор» — скрыть конкретное замечание (список персистентный, сброс — «Сбросить игноры (N)» в настройках); «Исправить» — авто-фикс, есть у переименований (`layer-naming-camelcase` → camelCase, `component-name-pascalcase` → PascalCase): переименовывает узел прямо в Figma.
+
 ## 1. Базовые unbound-проверки (унаследованы от Component Audit, MIT)
 
 Проверяют «привязано ли» — hardcoded-значение без переменной/стиля. Функция `checkForUnboundProperties`.
@@ -31,7 +33,6 @@
 | `spacing-region-scope` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard (в виджете — «на ревью») | `layout/page/*` внутри компонента; легален только для позиционирования полноэкранного оверлея от вьюпорта — машинно не различить, поэтому формулировка «проверить» |
 | `spacing-bind-semantic-layer` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard | прямая привязка переменной из коллекции `device`; исключения by design: `visible/*`, `system/device` |
 | `tier-discipline` | `docs/rules/tokens/tier-discipline.md` | soft | привязка primitive-токена (коллекция `primitive*` или путь `primitive/*`) вместо semantic-слоя |
-| `tokens-no-disabled-suffix-leaf` | `docs/rules/tokens/tier-discipline.md`, DEC-024 | hard | привязанный токен с leaf `<word>Disabled` (`bgDisabled`, `indicatorDisabled`); disabled реализуется через `opacity/disabled` overlay (DEC-023) |
 | `tokens-no-component-tier` | `docs/rules/tokens/tier-discipline.md`, DEC-014 | soft | middle-segment имени токена совпадает с именем component-set из сканируемых страниц (реестр слагов строится на старте скана) |
 | `gradient-stop-unbound` | `docs/rules/tokens/gradients.md`, DEC-036 | hard | стоп градиента (fill/stroke) без привязанной переменной цвета |
 
@@ -58,6 +59,12 @@
 - **`layer-naming-camelcase`**: внутрь INSTANCE не заходим (внутренности — зона master-компонента). Дефолтные Figma-имена (`Frame 123`, `Ellipse 1`) — валидные нарушения по правилу, но их может быть много: тумблер «Имена слоёв» позволяет отключить.
 - **`size`-ось не проверяется** на канон values: enum расширяемый (`lg|md|sm`, DEC-025), закрытого списка нет.
 - **Grid auto-layout**: `itemSpacing`/`gap` не проверяются вовсе (и unbound, и semantic-fit) — Figma хранит там устаревшие flow-значения.
+
+## Ретированные проверки
+
+| ruleId | Было | Снято | Причина |
+|---|---|---|---|
+| `tokens-no-disabled-suffix-leaf` (DEC-024) | запрет leaf `<word>Disabled` у привязанных токенов | 2026-07-23 (rules v1.4.0) | в ДС появились disabled-токены: disabled легально реализуется и через `opacity/disabled` overlay, и через прямые disabled-токены цвета — см. `docs/rules/.audit/2026-07-23-disabled-tokens-legalized.md` |
 
 ## Кандидаты (не реализовано)
 
