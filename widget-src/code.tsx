@@ -2087,7 +2087,9 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
               property: (prop.property || '').trim() || 'Unknown Property',
               currentValue: (prop.currentValue || '').trim() || 'N/A',
               nodePath: (prop.nodePath || '').trim() || 'Unknown Path',
-              nodeId: (prop.nodeId || '').trim() || undefined
+              nodeId: (prop.nodeId || '').trim() || undefined,
+              ruleId: prop.ruleId || undefined,
+              fixRename: prop.fixRename || undefined
             })) || [],
             // Ensure other optional properties have proper values
             componentSetName: component.componentSetName ? 
