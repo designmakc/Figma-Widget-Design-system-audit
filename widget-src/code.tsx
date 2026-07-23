@@ -143,7 +143,13 @@ const DS_RULE_SETTINGS: Record<string, string> = {
   'tier-discipline': 'showRuleTierDiscipline',
   'tokens-no-disabled-suffix-leaf': 'showRuleDisabledLeaf',
   'tokens-no-component-tier': 'showRuleComponentTier',
-  'gradient-stop-unbound': 'showRuleGradientStops'
+  'gradient-stop-unbound': 'showRuleGradientStops',
+  'component-name-pascalcase': 'showRuleComponentName',
+  'component-property-camelcase': 'showRulePropCamelCase',
+  'boolean-prefix-convention': 'showRuleBooleanPrefix',
+  'component-property-tier1-glossary': 'showRuleGlossary',
+  'state-axis-canonical-enum': 'showRuleGlossary',
+  'layer-naming-camelcase': 'showRuleLayerNaming'
 }
 
 const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]> => {
@@ -286,6 +292,140 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
     await walk(root, '')
   } catch (e) {
     console.error('Error in checkTokenMisuse:', e)
+  }
+  return findings
+}
+
+// ============================================================================
+// DS naming checks (A-block): component/property/layer naming conventions
+// docs/rules/components/*.md — DEC-032, DEC-007, DEC-031, DEC-025/030, DEC-008
+// ============================================================================
+
+const DS_PASCAL = /^[A-Z][a-zA-Z0-9]*$/
+const DS_CAMEL = /^[a-z][a-zA-Z0-9]*$/
+// Tier-1 glossary anti-names → canonical axis name (DEC-025).
+// 'position' intentionally absent: legit Tier-2 axis (e.g. corneroverlay).
+const DS_GLOSSARY_ANTINAMES: Record<string, string> = {
+  style: 'variant',
+  buttonSize: 'size',
+  level: 'priority',
+  weight: 'priority',
+  status: 'state',
+  mode: 'state',
+  side: 'labelPosition'
+}
+const DS_STATE_ENUM = ['default', 'hover', 'focus', 'empty', 'filled', 'loading', 'success', 'error', 'disabled']
+const DS_VARIANT_ENUM = ['solid', 'outline', 'ghost', 'unstyled']
+const DS_LABELPOS_ENUM = ['left', 'right']
+
+const dsNamingFinding = (node: BaseNode, property: string, ruleId: string, message: string): UnboundProperty => ({
+  type: 'tokenMisuse',
+  property,
+  currentValue: safeText(message),
+  nodePath: safeText(node.name),
+  nodeId: node.id,
+  ruleId
+})
+
+// Component-set-level checks: set name casing + property definitions.
+// Works for ComponentSetNode and standalone ComponentNode (not a variant).
+const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundProperty[] => {
+  const findings: UnboundProperty[] = []
+  const name = (root.name || '').trim()
+
+  // component-name-pascalcase (DEC-032, hard)
+  if (name && !DS_PASCAL.test(name)) {
+    findings.push(dsNamingFinding(root, 'Имя компонента', 'component-name-pascalcase',
+      `«${name}» — имя компонента должно быть PascalCase слитно, без пробелов/дефисов/подчёркиваний (component-name-pascalcase, DEC-032)`))
+  }
+
+  let defs: any = null
+  try {
+    defs = root.componentPropertyDefinitions
+  } catch (e) {
+    defs = null // variant components throw — definitions live on the set
+  }
+  if (!defs) return findings
+
+  for (const rawKey of Object.keys(defs)) {
+    const def = defs[rawKey]
+    const propName = rawKey.split('#')[0].trim()
+    if (!propName) continue
+
+    const isBooleanLike = def.type === 'BOOLEAN' ||
+      (def.type === 'VARIANT' && Array.isArray(def.variantOptions) &&
+       def.variantOptions.length === 2 &&
+       def.variantOptions.every((o: string) => o === 'true' || o === 'false'))
+
+    // component-property-camelcase (DEC-007, hard)
+    if (!DS_CAMEL.test(propName)) {
+      findings.push(dsNamingFinding(root, `Свойство ${propName}`, 'component-property-camelcase',
+        `«${propName}» — имя свойства должно быть camelCase (component-property-camelcase, DEC-007)`))
+    }
+
+    // boolean-prefix-convention (DEC-031, hard): is* / has*, запрет show*
+    if (isBooleanLike && !/^(is|has)[A-Z]/.test(propName)) {
+      const hint = /^show[A-Z]/.test(propName)
+        ? 'префикс show* запрещён — переименовать в has*'
+        : 'boolean-свойство обязано начинаться с is* (runtime-state) или has* (toggle видимости)'
+      findings.push(dsNamingFinding(root, `Свойство ${propName}`, 'boolean-prefix-convention',
+        `«${propName}» — ${hint} (boolean-prefix-convention, DEC-031)`))
+    }
+
+    // Tier-1 glossary (DEC-025, soft) + канонические enum-values
+    if (def.type === 'VARIANT') {
+      const canonical = DS_GLOSSARY_ANTINAMES[propName]
+      if (canonical) {
+        findings.push(dsNamingFinding(root, `Ось ${propName}`, 'component-property-tier1-glossary',
+          `ось «${propName}» — использовать каноническое имя «${canonical}» (component-property-tier1-glossary, DEC-025)`))
+      }
+      const options: string[] = Array.isArray(def.variantOptions) ? def.variantOptions : []
+      const checkEnum = (enumValues: string[], ruleId: string, dec: string) => {
+        const bad = options.filter(o => enumValues.indexOf(o) === -1)
+        if (bad.length > 0) {
+          findings.push(dsNamingFinding(root, `Ось ${propName}`, ruleId,
+            `значения вне канонического enum: ${bad.join(', ')} (допустимо: ${enumValues.join(' | ')}); расширение — только через bump правил (${dec})`))
+        }
+      }
+      if (propName === 'state') checkEnum(DS_STATE_ENUM, 'state-axis-canonical-enum', 'DEC-030')
+      if (propName === 'variant') checkEnum(DS_VARIANT_ENUM, 'component-property-tier1-glossary', 'DEC-025')
+      if (propName === 'labelPosition') checkEnum(DS_LABELPOS_ENUM, 'component-property-tier1-glossary', 'DEC-025')
+    }
+  }
+
+  return findings
+}
+
+// layer-naming-camelcase (DEC-008, hard): walk layers inside a variant.
+// Skips: INSTANCE nodes (named after their master component, PascalCase is
+// expected) and auto-named TEXT (name mirrors content — not a naming decision).
+const checkLayerNaming = (root: ComponentNode): UnboundProperty[] => {
+  const findings: UnboundProperty[] = []
+
+  const walk = (node: SceneNode, path: string) => {
+    if (!('children' in node) || !node.children) return
+    for (const child of node.children) {
+      if (child.type === 'INSTANCE') continue
+      const childName = (child.name || '').trim()
+      const isAutoText = child.type === 'TEXT' && (child as TextNode).autoRename
+      if (!isAutoText && childName && !DS_CAMEL.test(childName)) {
+        findings.push({
+          type: 'tokenMisuse',
+          property: 'Имя слоя',
+          currentValue: safeText(`«${childName}» — имя слоя должно быть camelCase (layer-naming-camelcase, DEC-008)`),
+          nodePath: safeText(path ? `${path} > ${childName}` : childName),
+          nodeId: child.id,
+          ruleId: 'layer-naming-camelcase'
+        })
+      }
+      walk(child, path ? `${path} > ${childName}` : childName)
+    }
+  }
+
+  try {
+    walk(root, '')
+  } catch (e) {
+    console.error('Error in checkLayerNaming:', e)
   }
   return findings
 }
@@ -451,6 +591,11 @@ interface SettingsState {
   showRuleDisabledLeaf: boolean
   showRuleComponentTier: boolean
   showRuleGradientStops: boolean
+  showRuleComponentName: boolean
+  showRulePropCamelCase: boolean
+  showRuleBooleanPrefix: boolean
+  showRuleGlossary: boolean
+  showRuleLayerNaming: boolean
   hideZeroValues: boolean
   showFillValues: boolean
   // Stroke group
@@ -509,6 +654,11 @@ function Widget() {
     showRuleDisabledLeaf: true,
     showRuleComponentTier: true,
     showRuleGradientStops: true,
+    showRuleComponentName: true,
+    showRulePropCamelCase: true,
+    showRuleBooleanPrefix: true,
+    showRuleGlossary: true,
+    showRuleLayerNaming: true,
     hideZeroValues: true,
     showFillValues: true,
     // Stroke group
@@ -1177,36 +1327,39 @@ function Widget() {
         // Add component set entry if we haven't processed it yet
         if (componentSetName && !processedComponentSets.has(componentSet.id)) {
           processedComponentSets.add(componentSet.id)
-          
+
+          // Set-level DS naming checks: set name casing + property definitions
+          const setNamingFindings = checkComponentNaming(componentSet)
+
           result.push({
             id: componentSet.id || 'unknown-component-set',
             name: componentSetName,
             pageName: safePageName,
             hasDescription: hasDescription(componentSet as any), // ComponentSetNode has same description property
             hasDocumentationLink: hasDocumentationLink(componentSet as any), // ComponentSetNode has same documentationLinks property
-            hasUnboundProperties: false, // Component sets don't have unbound properties directly
-            unboundProperties: [],
+            hasUnboundProperties: setNamingFindings.length > 0,
+            unboundProperties: setNamingFindings,
             isHiddenFromPublishing: isHiddenFromPublishing(componentSetName),
             isOnCurrentPage: safePageName === currentPageName,
             isComponentSet: true
           })
         }
-        
+
         const variantString = (component.name || '').trim()
         if (variantString) {
           const properties: Record<string, string> = {}
-          
+
           const pairs = variantString.split(',')
             .map(pair => pair.trim())
             .filter(pair => pair.length > 0 && pair.includes('='))
-          
+
           pairs.forEach(pair => {
             const [key, value] = pair.split('=').map(part => part.trim())
             if (key && key.length > 0 && value && value.length > 0) {
               properties[key] = value
             }
           })
-          
+
           if (Object.keys(properties).length > 0) {
             variantProperties = properties
           }
@@ -1215,7 +1368,11 @@ function Widget() {
 
       const unboundCheck = checkForUnboundProperties(component)
       const misuseFindings = await checkTokenMisuse(component)
-      const allProperties = [...unboundCheck.properties, ...misuseFindings]
+      // Standalone components carry their own name/props checks; variants — layer naming
+      const namingFindings = isVariant
+        ? checkLayerNaming(component)
+        : [...checkComponentNaming(component), ...checkLayerNaming(component)]
+      const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
 
       // Add individual component/variant entry
       result.push({
@@ -1251,8 +1408,8 @@ function Widget() {
     // Update hasExpandableContent for all entries
     return result.map(component => ({
       ...component,
-      hasExpandableContent: component.isComponentSet 
-        ? componentSetExpandability.get(component.id) || false
+      hasExpandableContent: component.isComponentSet
+        ? (componentSetExpandability.get(component.id) || component.hasUnboundProperties)
         : component.hasUnboundProperties
     }))
   }
@@ -1811,6 +1968,11 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showRuleDisabledLeaf: true,
       showRuleComponentTier: true,
       showRuleGradientStops: true,
+      showRuleComponentName: true,
+      showRulePropCamelCase: true,
+      showRuleBooleanPrefix: true,
+      showRuleGlossary: true,
+      showRuleLayerNaming: true,
       hideZeroValues: true,
       showFillValues: true,
       // Stroke group
@@ -2109,8 +2271,8 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                   <AutoLayout direction="horizontal" spacing={8} width="fill-parent" verticalAlignItems="center">
                     <AutoLayout direction="vertical" spacing={4} width="fill-parent">
                       <AutoLayout direction="horizontal" spacing={8} width="fill-parent">
-                        <Text fontSize={11} fill="#6A0000" width={160}>{safeProperty}:</Text>
-                        <Text fontSize={11} fill="#6A0000">{safeCurrentValue}</Text>
+                        <Text fontSize={11} fill="#6A0000" width={110}>{safeProperty}:</Text>
+                        <Text fontSize={11} fill="#6A0000" width="fill-parent">{safeCurrentValue}</Text>
                       </AutoLayout>
                     </AutoLayout>
                     {isOnCurrentPage && (
@@ -2458,6 +2620,15 @@ const SettingsPanel = ({
               <SimpleCheckbox checked={settings.showRuleDisabledLeaf !== false} label="*Disabled leaf" onClick={() => toggleSetting('showRuleDisabledLeaf')} />
               <SimpleCheckbox checked={settings.showRuleComponentTier !== false} label="Component-tier" onClick={() => toggleSetting('showRuleComponentTier')} />
               <SimpleCheckbox checked={settings.showRuleGradientStops !== false} label="Стопы градиентов" onClick={() => toggleSetting('showRuleGradientStops')} isLast={true} />
+            </AutoLayout>
+
+            {/* DS naming rules group */}
+            <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
+              <SimpleCheckbox checked={settings.showRuleComponentName !== false} label="Имя компонента" onClick={() => toggleSetting('showRuleComponentName')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showRulePropCamelCase !== false} label="camelCase свойств" onClick={() => toggleSetting('showRulePropCamelCase')} />
+              <SimpleCheckbox checked={settings.showRuleBooleanPrefix !== false} label="is*/has*" onClick={() => toggleSetting('showRuleBooleanPrefix')} />
+              <SimpleCheckbox checked={settings.showRuleGlossary !== false} label="Глоссарий осей" onClick={() => toggleSetting('showRuleGlossary')} />
+              <SimpleCheckbox checked={settings.showRuleLayerNaming !== false} label="Имена слоёв" onClick={() => toggleSetting('showRuleLayerNaming')} isLast={true} />
             </AutoLayout>
           </AutoLayout>
         )}
@@ -3066,11 +3237,19 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         let variantProperties: Record<string, string> | undefined
         let displayName = (component.name || '').trim() || 'Unnamed Component'
         let isVariant = false
+        // Selection results have no set rows — attach set-level naming findings
+        // to the first scanned variant of each set
+        let setNamingFindings: UnboundProperty[] = []
 
         if (component.parent && component.parent.type === 'COMPONENT_SET') {
           const componentSet = component.parent as ComponentSetNode
           componentSetName = (componentSet.name || '').trim() || 'Unnamed Component Set'
-          
+
+          if (!processedComponentSets.has(componentSet.id)) {
+            processedComponentSets.add(componentSet.id)
+            setNamingFindings = checkComponentNaming(componentSet)
+          }
+
           try {
             variantProperties = component.variantProperties || {}
             isVariant = true
@@ -3082,7 +3261,10 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
 
         const unboundCheck = checkForUnboundProperties(component)
         const misuseFindings = await checkTokenMisuse(component)
-        const allProperties = [...unboundCheck.properties, ...misuseFindings]
+        const namingFindings = isVariant
+          ? [...setNamingFindings, ...checkLayerNaming(component)]
+          : [...checkComponentNaming(component), ...checkLayerNaming(component)]
+        const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
 
         result.push({
           id: component.id,
