@@ -1,171 +1,60 @@
-# 🔍 Figma Component Audit Widget
+# DS Audit — Figma-виджет аудита дизайн-системы Genlab
 
-A powerful Figma widget designed to audit and analyze your design system components, helping you maintain consistency and identify potential issues in your component library.
+Внутренний виджет для аудита компонентов в Figma: находит непривязанные свойства (hardcoded-значения вместо токенов) **и проверяет соответствие правилам нашей дизайн-системы** (`docs/rules/` в DS-репо, v1.3.0+).
 
-## ✨ Features
+Основан на MIT-виджете «Component Audit» Luis Ouriach — см. [LICENSE](LICENSE).
 
-### Quick Scan
-- **Overview Analysis**: Get a high-level summary of your component library across all pages
-- **Statistics Dashboard**: View total pages, unique components, variants, and missing metadata
-- **Performance Optimized**: Fast scanning that won't crash Figma with large files
+## Что проверяет
 
-### Deep Analysis
-- **Unbound Properties Detection**: Identify components with hardcoded values instead of design tokens
-- **Metadata Validation**: Check for missing descriptions and documentation links
-- **Component Navigation**: Click to jump directly to any component in your file
-- **Publishing Status**: Identify components hidden from publishing (prefixed with `.` or `_`)
+### Базовые проверки (unbound-детект)
 
-### Smart UI/UX
-- **Progressive Loading**: Load components in chunks to prevent crashes
-- **Collapsible Results**: Expand/collapse pages and individual components
-- **Visual Indicators**: Color-coded status icons for quick assessment
-- **Summary Frame Export**: Generate a styled summary frame on your canvas
+- заливки, обводки (цвет и толщина), типографика, радиусы углов, отступы auto-layout, эффекты, прозрачность — всё без привязанной переменной или стиля;
+- метаданные: описание компонента, ссылка на документацию;
+- статус публикации (префиксы `.` / `_`).
 
-## 🚀 To run this widget locally in your organisation:
+### Проверки правил ДС (semantic-fit токенов)
 
-### Prerequisites
-- [Node.js](https://nodejs.org/en/download/) (comes with npm)
-- [Visual Studio Code](https://code.visualstudio.com/) (recommended)
+Не только «привязано ли», но и «привязан ли **правильный** токен»:
 
-### Setup
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/louriach/Figma-Widget-Design-system-audit.git
-   cd Figma-Widget-Design-system-audit
-   ```
+| Правило | Что ловит |
+|---|---|
+| `spacing-category-property-match` | gap-свойство с `*/padding/*` или `*/margin/*` токеном и наоборот |
+| `spacing-layout-vocabulary` | `layout/`-токен вне закрытого словаря (дореформенные имена) |
+| `spacing-region-scope` | `layout/page/*` внутри компонента |
+| `spacing-bind-semantic-layer` | прямая привязка коллекции `device` (кроме `visible/*`, `system/device`) |
+| `tier-discipline` | привязка primitive-токена напрямую |
+| `tokens-no-disabled-suffix-leaf` (DEC-024) | токены с leaf `<word>Disabled` |
+| `tokens-no-component-tier` (DEC-014) | сегмент токена совпадает с именем компонента |
+| `gradient-stop-unbound` (DEC-036) | стопы градиентов без переменных |
 
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
+Каждое правило отключается отдельным тумблером в настройках («Правила ДС»).
 
-3. Start the development build:
-   ```bash
-   npm run watch
-   ```
+## Режимы сканирования
 
-4. In Figma:
-   - Go to **Plugins > Development > Import plugin from manifest**
-   - Select the `manifest.json` file from this project
+- **Быстрый скан** — обзор по всем страницам: количество компонентов, отсутствующие описания и ссылки. Сводку можно выложить на канвас (с JSON для версионирования).
+- **Выделение** — глубокий анализ выделенных компонентов.
+- **Текущая страница / Весь файл** — глубокий анализ с непривязанными свойствами и проверками правил ДС.
 
-## 📖 Usage
+## Установка
 
-### Quick Scan
-1. Open the widget in Figma
-2. Click **"Quick Scan"** to analyze your entire file
-3. Review the summary statistics and component overview
-4. Optionally click **"Add summary to canvas"** to create a visual report
-
-### Deep Analysis
-1. After running a quick scan, choose your scope:
-   - **Current page**: Analyze only the active page (recommended for large files)
-   - **All pages**: Analyze the entire file (may be slow for large files)
-2. Click **"Deep scan"** to perform detailed analysis
-3. Expand pages to see individual components
-4. Click the expand icon (▶️) next to components with issues to see details
-5. Use the navigation icon (🔗) to jump to components on the current page
-
-### Understanding Results
-
-#### Component Status Indicators
-- ✅ **Green Check**: Component meets best practices
-- ❌ **Red X**: Component has issues that need attention
-- 🔗 **Link Icon**: Click to navigate to component (only shown for current page)
-
-#### Unbound Properties
-The widget detects components with hardcoded values instead of design tokens:
-- **Colors**: Fill and stroke colors without variables or styles
-- **Typography**: Font family, size, and line height without variables
-- **Spacing**: Padding and item spacing without variables
-- **Effects**: Drop shadows and other effects without styles
-- **Corner Radius**: Border radius without variables
-- **Stroke Weight**: Stroke width without variables
-
-## 🛠️ Technical Details
-
-### Architecture
-- **TypeScript**: Full type safety and better development experience
-- **React-like JSX**: Familiar component-based UI development
-- **Figma Widget API**: Native integration with Figma's design tools
-- **Progressive Loading**: Chunked rendering to handle large component sets
-
-### Performance Optimizations
-- **Chunked Loading**: Components load in groups of 5 to prevent crashes
-- **Conditional Rendering**: Navigation icons only show for current page
-- **Error Boundaries**: Graceful handling of rendering errors
-- **Safety Limits**: Warning for pages with >100 components
-
-### Data Structure
-```typescript
-interface ComponentAuditData {
-  id: string
-  name: string
-  componentSetName?: string
-  variantProperties?: Record<string, string>
-  pageName: string
-  hasDescription: boolean
-  hasDocumentationLink: boolean
-  hasUnboundProperties: boolean
-  unboundProperties: UnboundProperty[]
-  isHiddenFromPublishing: boolean
-  isOnCurrentPage: boolean
-}
-```
-
-## 🎯 Best Practices
-
-### For Design Systems
-1. **Use Design Tokens**: Replace hardcoded values with variables
-2. **Add Descriptions**: Document component purpose and usage
-3. **Include Documentation**: Link to design system documentation
-4. **Consistent Naming**: Use clear, descriptive component names
-5. **Publishing Strategy**: Hide internal components with `.` or `_` prefix
-
-### For Large Files
-1. **Page-by-Page Analysis**: Use "Current page" mode for better performance
-2. **Regular Audits**: Run scans periodically to catch issues early
-3. **Team Coordination**: Share audit results with your design team
-
-## 🔧 Development
-
-### Building
 ```bash
-# Development mode (watches for changes)
-npm run watch
-
-# Production build
+npm install
 npm run build
 ```
 
-### Project Structure
-```
-├── manifest.json          # Widget configuration
-├── package.json           # Dependencies and scripts
-├── widget-src/
-│   ├── code.tsx          # Main widget code
-│   └── tsconfig.json     # TypeScript configuration
-├── dist/                 # Compiled JavaScript (auto-generated)
-└── README.md            # This file
+В Figma: **Widgets → Development → Import widget from manifest…** → выбрать `manifest.json` из корня репо.
+
+## Разработка
+
+```bash
+npm run watch   # пересборка при изменениях
+npm run tsc     # проверка типов
 ```
 
-## 🤝 Contributing
+Весь код виджета — [`widget-src/code.tsx`](widget-src/code.tsx). DS-проверки — блок `checkTokenMisuse` + `DS_RULE_SETTINGS` (искать по `DS token semantic-fit checks`).
 
-1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/feature-name`
-3. Commit your changes: `git commit -m 'Add feature'`
-4. Push to the branch: `git push origin feature/feature-name`
-5. Open a Pull Request
+## Связь с DS-репо
 
-## 📝 License
+Правила зашиты константами в `code.tsx` и соответствуют `docs/rules/tokens/*.md` DS-репо. При bump'е правил ДС — синхронизировать проверки вручную (правила меняются редко).
 
-This project is open source and available under the [MIT License](LICENSE).
-
-## 🙏 Acknowledgments
-
-- Built with the [Figma Widget API](https://www.figma.com/widget-docs/)
-- Inspired by the need for better design system auditing tools
-- Thanks to the Figma community for feedback and suggestions
-
----
-
-**Happy auditing 🎉**
+Известное упрощение: у стопов градиентов проверяется только факт привязки, без проверки префикса `color/gradient/*` — живые переменные пока без `color/`-префикса (rename pending, DEC-036).
