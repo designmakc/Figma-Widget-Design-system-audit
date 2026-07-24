@@ -47,6 +47,7 @@ interface ComponentAuditData {
   isComponentSet?: boolean  // True if this represents the component set itself
   isVariant?: boolean       // True if this is a variant within a component set
   hasExpandableContent?: boolean  // True if component set has variants with unbound properties, or individual component has unbound properties
+  usedComponents?: string[] // Library/local components instantiated inside (what devs import)
 }
 
 interface PageProgress {
@@ -488,6 +489,39 @@ const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundPr
   return findings
 }
 
+// Collect components instantiated inside a variant — the dev's import list.
+// Top-level instances only: what's inside an INSTANCE is its master's business.
+const collectUsedComponents = async (root: ComponentNode): Promise<string[]> => {
+  const used = new Set<string>()
+
+  const walk = async (node: SceneNode): Promise<void> => {
+    if (!('children' in node) || !node.children) return
+    for (const child of node.children) {
+      if (child.type === 'INSTANCE') {
+        try {
+          const main = await (child as InstanceNode).getMainComponentAsync()
+          if (main) {
+            const setName = main.parent && main.parent.type === 'COMPONENT_SET'
+              ? (main.parent.name || '').trim()
+              : ''
+            const name = setName || (main.name || '').trim()
+            if (name) used.add(main.remote ? `${name} — внешняя библиотека` : name)
+          }
+        } catch (e) { /* dangling instance — skip */ }
+        continue // не спускаемся внутрь инстанса
+      }
+      await walk(child)
+    }
+  }
+
+  try {
+    await walk(root)
+  } catch (e) {
+    console.error('Error in collectUsedComponents:', e)
+  }
+  return Array.from(used).sort()
+}
+
 // layer-naming-camelcase (DEC-008, hard): walk layers inside a variant.
 // Skips: INSTANCE nodes (named after their master component, PascalCase is
 // expected) and auto-named TEXT (name mirrors content — not a naming decision).
@@ -675,6 +709,7 @@ interface SettingsState {
   showMissingDocsLink: boolean
   showMissingVariables: boolean
   showTokenMisuse: boolean
+  showUsedComponents: boolean
   // DS rules group (per-rule toggles)
   showRuleSpacingCategory: boolean
   showRuleLayoutVocab: boolean
@@ -738,6 +773,7 @@ function Widget() {
     showMissingDocsLink: true,
     showMissingVariables: true,
     showTokenMisuse: true,
+    showUsedComponents: true,
     showRuleSpacingCategory: true,
     showRuleLayoutVocab: true,
     showRuleRegionScope: true,
@@ -1540,6 +1576,7 @@ function Widget() {
         ? checkLayerNaming(component)
         : [...checkComponentNaming(component), ...checkLayerNaming(component)]
       const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
+      const usedComponents = await collectUsedComponents(component)
 
       // Add individual component/variant entry
       result.push({
@@ -1554,7 +1591,8 @@ function Widget() {
         unboundProperties: allProperties,
         isHiddenFromPublishing: isHiddenFromPublishing(componentSetName || displayName),
         isOnCurrentPage: safePageName === currentPageName,
-        isVariant
+        isVariant,
+        usedComponents: usedComponents.length > 0 ? usedComponents : undefined
       })
     }
 
@@ -1562,23 +1600,42 @@ function Widget() {
     // A component set is expandable if any of its variants have unbound properties
     const componentSetExpandability = new Map<string, boolean>()
     
+    const setUsedComponents = new Map<string, Set<string>>()
+
     result.forEach(component => {
-      if (component.isVariant && component.componentSetName && component.hasUnboundProperties) {
-        // Find the corresponding component set entry
+      if (component.isVariant && component.componentSetName) {
         const componentSetEntry = result.find(c => c.isComponentSet && c.name === component.componentSetName)
         if (componentSetEntry) {
-          componentSetExpandability.set(componentSetEntry.id, true)
+          if (component.hasUnboundProperties) {
+            componentSetExpandability.set(componentSetEntry.id, true)
+          }
+          // Union of variant deps → set entry
+          if (component.usedComponents) {
+            if (!setUsedComponents.has(componentSetEntry.id)) {
+              setUsedComponents.set(componentSetEntry.id, new Set())
+            }
+            const bucket = setUsedComponents.get(componentSetEntry.id)!
+            component.usedComponents.forEach(n => bucket.add(n))
+          }
         }
       }
     })
-    
+
     // Update hasExpandableContent for all entries
-    return result.map(component => ({
-      ...component,
-      hasExpandableContent: component.isComponentSet
-        ? (componentSetExpandability.get(component.id) || component.hasUnboundProperties)
-        : component.hasUnboundProperties
-    }))
+    return result.map(component => {
+      const setUsed = component.isComponentSet ? setUsedComponents.get(component.id) : undefined
+      const usedComponents = component.isComponentSet
+        ? (setUsed && setUsed.size > 0 ? Array.from(setUsed).sort() : undefined)
+        : component.usedComponents
+      const hasDeps = !!(usedComponents && usedComponents.length > 0)
+      return {
+        ...component,
+        usedComponents,
+        hasExpandableContent: component.isComponentSet
+          ? (componentSetExpandability.get(component.id) || component.hasUnboundProperties || hasDeps)
+          : (component.hasUnboundProperties || hasDeps)
+      }
+    })
   }
 
   const runQuickScan = async () => {
@@ -2009,7 +2066,8 @@ function Widget() {
     const hasActiveFilters = settings.showMissingDescription ||
                              settings.showMissingDocsLink ||
                              settings.showMissingVariables ||
-                             settings.showTokenMisuse
+                             settings.showTokenMisuse ||
+                             settings.showUsedComponents
     
     // If no filters are active, show nothing
     if (!hasActiveFilters) {
@@ -2043,6 +2101,10 @@ function Widget() {
     }
 
     if (settings.showTokenMisuse && component.unboundProperties.some(p => p.type === 'tokenMisuse')) {
+      matchesFilter = true
+    }
+
+    if (settings.showUsedComponents && component.usedComponents && component.usedComponents.length > 0) {
       matchesFilter = true
     }
 
@@ -2132,6 +2194,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showMissingDocsLink: true,
       showMissingVariables: true,
       showTokenMisuse: true,
+      showUsedComponents: true,
       showRuleSpacingCategory: true,
       showRuleLayoutVocab: true,
       showRuleRegionScope: true,
@@ -2212,6 +2275,9 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
               fixBindName: prop.fixBindName || undefined,
               fixBindField: prop.fixBindField || undefined
             })) || [],
+            usedComponents: component.usedComponents && component.usedComponents.length > 0
+              ? component.usedComponents.map(n => (n || '').trim()).filter(Boolean)
+              : undefined,
             // Ensure other optional properties have proper values
             componentSetName: component.componentSetName ? 
               (component.componentSetName.trim() || undefined) : undefined,
@@ -2742,6 +2808,11 @@ const SettingsPanel = ({
           checked={settings.showTokenMisuse}
           label="Правила ДС"
           onClick={() => toggleSetting('showTokenMisuse')}
+        />
+        <SimpleCheckbox
+          checked={settings.showUsedComponents !== false}
+          label="Используемые компоненты"
+          onClick={() => toggleSetting('showUsedComponents')}
           isLast={true}
         />
       </AutoLayout>
@@ -2919,6 +2990,9 @@ const ComponentTable = ({ components, displayedCount, settings }: {
             isComponentSet: Boolean(component.isComponentSet),
             isVariant: Boolean(component.isVariant),
             hasExpandableContent: Boolean(component.hasExpandableContent),
+            usedComponents: component.usedComponents && component.usedComponents.length > 0
+              ? component.usedComponents
+              : undefined,
           // Clean variant properties completely
           variantProperties: component.variantProperties ? (() => {
             const cleaned: Record<string, string> = {}
@@ -3092,6 +3166,26 @@ const ComponentTable = ({ components, displayedCount, settings }: {
                 )}
               </AutoLayout>
               
+              {isExpanded && settings.showUsedComponents !== false &&
+               safeComponent.usedComponents && safeComponent.usedComponents.length > 0 && (
+                <AutoLayout
+                  direction="vertical"
+                  spacing={6}
+                  padding={{ vertical: 8, horizontal: 12 }}
+                  fill={index % 2 === 0 ? "#FFFFFF" : "#FAFAFA"}
+                  width="fill-parent"
+                >
+                  <Text fontSize={12} fontWeight={600} fill="#000">
+                    {`📦 Используемые компоненты (${safeText(safeComponent.usedComponents.length)})`}
+                  </Text>
+                  <AutoLayout direction="vertical" spacing={4} padding={{ top: 2, right: 12, bottom: 8, left: 12 }} fill="#F0F8FF" cornerRadius={8} width="fill-parent">
+                    {safeComponent.usedComponents.map((depName, depIndex) => (
+                      <Text key={`dep-${depIndex}`} fontSize={11} fill="#0C4990">{`• ${safeText(depName)}`}</Text>
+                    ))}
+                  </AutoLayout>
+                </AutoLayout>
+              )}
+
               {isExpanded && safeComponent.hasUnboundProperties && (() => {
                 // Check if there are any properties after filtering
                 const filteredProps = filterUnboundPropertiesWithZeroValues(safeComponent.unboundProperties)
@@ -3502,6 +3596,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           ? [...setNamingFindings, ...checkLayerNaming(component)]
           : [...checkComponentNaming(component), ...checkLayerNaming(component)]
         const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
+        const usedComponents = await collectUsedComponents(component)
 
         result.push({
           id: component.id,
@@ -3516,7 +3611,8 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           isHiddenFromPublishing: isHiddenFromPublishing(componentSetName || displayName),
           isOnCurrentPage: true,
           isVariant,
-          hasExpandableContent: allProperties.length > 0
+          usedComponents: usedComponents.length > 0 ? usedComponents : undefined,
+          hasExpandableContent: allProperties.length > 0 || usedComponents.length > 0
         })
       }
 
