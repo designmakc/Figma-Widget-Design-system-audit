@@ -449,9 +449,17 @@ const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundPr
 
     // boolean-prefix-convention (DEC-031, hard): is* / has*, запрет show*
     if (isBooleanLike && !/^(is|has)[A-Z]/.test(propName)) {
-      const hint = /^show[A-Z]/.test(propName)
-        ? 'префикс show* запрещён — переименовать в has*'
-        : 'boolean-свойство обязано начинаться с is* (runtime-state) или has* (toggle видимости)'
+      let hint: string
+      const prefixed = propName.match(/^(is|has)([a-z].*)$/)
+      if (/^show[A-Z]/.test(propName)) {
+        hint = 'префикс show* запрещён — переименовать в has*'
+      } else if (prefixed) {
+        // Prefix is there, but the next letter is lowercase — camelCase break
+        const suggested = prefixed[1] + prefixed[2].charAt(0).toUpperCase() + prefixed[2].slice(1)
+        hint = `после префикса ${prefixed[1]}* должна идти заглавная буква — «${suggested}»`
+      } else {
+        hint = 'boolean-свойство обязано начинаться с is* (runtime-state) или has* (toggle видимости)'
+      }
       findings.push(dsNamingFinding(root, `Свойство ${propName}`, 'boolean-prefix-convention',
         `«${propName}» — ${hint} (boolean-prefix-convention, DEC-031)`))
     }
