@@ -27,6 +27,9 @@ interface UnboundProperty {
   nodeId?: string  // Store the actual node ID for direct navigation
   ruleId?: string  // DS rule id for tokenMisuse findings (per-rule settings filter)
   fixRename?: string  // auto-fix: rename target node to this value
+  fixBindVariableId?: string  // auto-fix: bind this variable...
+  fixBindName?: string        // ...(display name)...
+  fixBindField?: string       // ...to this bindable node field
 }
 
 interface ComponentAuditData {
@@ -119,6 +122,74 @@ const buildSlugRegistry = (pages: PageNode[]) => {
       if (slug) dsComponentSlugs.add(slug)
     })
   })
+}
+
+// ---------------------------------------------------------------------------
+// Token suggestions: value → FLOAT-token map, built once per scan.
+// Enables "Привязать" auto-fix on unbound numeric findings.
+// ---------------------------------------------------------------------------
+
+interface DsFloatToken { value: number; id: string; name: string; collection: string }
+let dsFloatTokens: DsFloatToken[] = []
+
+const dsResolveFloatValue = async (varObj: any, depth: number): Promise<number | null> => {
+  if (!varObj || depth > 4) return null
+  let col: any = null
+  try {
+    col = await figma.variables.getVariableCollectionByIdAsync(varObj.variableCollectionId)
+  } catch (e) { /* remote collection */ }
+  if (!col) return null
+  const modeId = col.defaultModeId || (col.modes && col.modes[0] && col.modes[0].modeId)
+  const raw = varObj.valuesByMode ? varObj.valuesByMode[modeId] : undefined
+  if (typeof raw === 'number') return raw
+  if (raw && typeof raw === 'object' && (raw as any).type === 'VARIABLE_ALIAS') {
+    try {
+      const next = await figma.variables.getVariableByIdAsync((raw as any).id)
+      return dsResolveFloatValue(next, depth + 1)
+    } catch (e) { return null }
+  }
+  return null
+}
+
+const buildFloatTokenMap = async () => {
+  dsFloatTokens = []
+  try {
+    const vars = await figma.variables.getLocalVariablesAsync('FLOAT')
+    const collections = await figma.variables.getLocalVariableCollectionsAsync()
+    const colById: Record<string, any> = {}
+    collections.forEach(c => { colById[c.id] = c })
+    for (const v of vars) {
+      const col = colById[v.variableCollectionId]
+      if (!col) continue
+      const colName = (col.name || '').toLowerCase()
+      // device — hidden engine (bind semantic), primitives — not for direct binding
+      if (colName === 'device' || colName.indexOf('primitive') === 0) continue
+      const value = await dsResolveFloatValue(v, 0)
+      if (value !== null) {
+        dsFloatTokens.push({ value, id: v.id, name: v.name, collection: col.name })
+      }
+    }
+  } catch (e) {
+    console.error('Error building float token map:', e)
+  }
+}
+
+// Category regex must agree with spacing-category-property-match — never
+// suggest a token our own rules would then flag
+const DS_SUGGEST_CATEGORY: Record<string, RegExp> = {
+  gap: /(^|\/)gap\//,
+  padding: /(^|\/)padding\//,
+  radius: /^radius\//,
+  borderWidth: /^borderWidth\//
+}
+
+const dsSuggestToken = (value: number, category: string): DsFloatToken | null => {
+  const rx = DS_SUGGEST_CATEGORY[category]
+  if (!rx || dsFloatTokens.length === 0) return null
+  const candidates = dsFloatTokens.filter(t => Math.abs(t.value - value) < 0.01 && rx.test(t.name))
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => a.name.length - b.name.length)
+  return candidates[0]
 }
 
 const DS_GAP_PROPS = ['itemSpacing', 'counterAxisSpacing', 'gap']
@@ -719,6 +790,39 @@ function Widget() {
     }
   }
 
+  const removeFindingFromAudit = (key: string) => {
+    setAuditData(auditData.map(c => {
+      const rest = c.unboundProperties.filter(p => findingKey(p) !== key)
+      if (rest.length === c.unboundProperties.length) return c
+      return { ...c, unboundProperties: rest, hasUnboundProperties: rest.length > 0 }
+    }))
+  }
+
+  const applyFixBind = async (componentId: string, prop: UnboundProperty) => {
+    if (!prop.fixBindVariableId || !prop.fixBindField || !prop.nodeId) return
+    try {
+      const node: any = await figma.getNodeByIdAsync(prop.nodeId)
+      const variable = await figma.variables.getVariableByIdAsync(prop.fixBindVariableId)
+      if (!node || !variable) {
+        figma.notify('❌ Узел или переменная не найдены — пересканируйте')
+        return
+      }
+      if (prop.fixBindField === 'cornerRadius') {
+        // Unified radius is not directly bindable — bind all four corners
+        for (const f of ['topLeftRadius', 'topRightRadius', 'bottomLeftRadius', 'bottomRightRadius']) {
+          node.setBoundVariable(f, variable)
+        }
+      } else {
+        node.setBoundVariable(prop.fixBindField, variable)
+      }
+      removeFindingFromAudit(findingKey(prop))
+      figma.notify(`✅ Привязан «${variable.name}»`)
+    } catch (e) {
+      console.error('Error applying bind fix:', e)
+      figma.notify('❌ Не удалось привязать переменную', { error: true })
+    }
+  }
+
   const applyFixRename = async (componentId: string, prop: UnboundProperty) => {
     if (!prop.fixRename || !prop.nodeId) return
     try {
@@ -728,12 +832,7 @@ function Widget() {
         return
       }
       node.name = prop.fixRename
-      const key = findingKey(prop)
-      setAuditData(auditData.map(c => {
-        const rest = c.unboundProperties.filter(p => findingKey(p) !== key)
-        if (rest.length === c.unboundProperties.length) return c
-        return { ...c, unboundProperties: rest, hasUnboundProperties: rest.length > 0 }
-      }))
+      removeFindingFromAudit(findingKey(prop))
       figma.notify(`✅ Переименовано: «${prop.fixRename}»`)
     } catch (e) {
       console.error('Error applying fix:', e)
@@ -764,6 +863,17 @@ function Widget() {
 
   const checkForUnboundProperties = (node: ComponentNode): { hasUnbound: boolean; properties: UnboundProperty[] } => {
     const unboundProperties: UnboundProperty[] = [];
+
+    // Attach a bind-suggestion when a token with this exact value exists
+    const withSuggestion = (finding: UnboundProperty, value: number, category: string, field: string): UnboundProperty => {
+      const s = dsSuggestToken(value, category)
+      if (s) {
+        finding.fixBindVariableId = s.id
+        finding.fixBindName = s.name
+        finding.fixBindField = field
+      }
+      return finding
+    }
 
     const checkNodeForUnboundProps = (node: SceneNode, path: string = ''): void => {
       // Ensure we never create empty currentPath using safeText
@@ -861,13 +971,13 @@ function Widget() {
                                    leftBound.type === 'VARIABLE_ALIAS';
               
               if (!isWeightBound && !allSidesBound) {
-                unboundProperties.push({
+                unboundProperties.push(withSuggestion({
                   type: 'stroke',
                   property: 'Stroke Weight',
                   currentValue: safeText(`${node.strokeWeight}px`),
                   nodePath: safeText(currentPath),
                   nodeId: node.id
-                });
+                }, node.strokeWeight, 'borderWidth', 'strokeWeight'));
               }
             } else if (node.strokeWeight === figma.mixed) {
               // Individual stroke weights - check each side
@@ -886,13 +996,13 @@ function Widget() {
                                      (boundVar as any).type === 'VARIABLE_ALIAS';
                   
                   if (!isSideBound) {
-                    unboundProperties.push({
+                    unboundProperties.push(withSuggestion({
                       type: 'stroke',
                       property: side.name,
                       currentValue: safeText(`${side.value}px`),
                       nodePath: safeText(currentPath),
                       nodeId: node.id
-                    });
+                    }, side.value, 'borderWidth', side.key));
                   }
                 }
               });
@@ -988,13 +1098,13 @@ function Widget() {
                                   boundVar.type === 'VARIABLE_ALIAS';
               
               if (!hasCornerVar) {
-                unboundProperties.push({
+                unboundProperties.push(withSuggestion({
                   type: 'cornerRadius',
                   property: corner.name,
                   currentValue: safeText(`${corner.value}px`),
                   nodePath: safeText(currentPath),
                   nodeId: node.id
-                });
+                }, corner.value, 'radius', corner.key));
               }
             }
           });
@@ -1014,13 +1124,13 @@ function Widget() {
             });
 
           if (!hasUnifiedCornerVar && !allCornersIndividuallyBound) {
-            unboundProperties.push({
+            unboundProperties.push(withSuggestion({
               type: 'cornerRadius',
               property: 'All Corners',
               currentValue: safeText(`${node.cornerRadius}px`),
               nodePath: safeText(currentPath),
               nodeId: node.id
-            });
+            }, node.cornerRadius as number, 'radius', 'cornerRadius'));
           }
         }
       }
@@ -1045,13 +1155,13 @@ function Widget() {
                              boundVar.type === 'VARIABLE_ALIAS';
             
             if (!hasGapVar) {
-              unboundProperties.push({
+              unboundProperties.push(withSuggestion({
                 type: 'spacing',
                 property: 'Gap',
                 currentValue: safeText(`${gap}px`),
                 nodePath: safeText(currentPath),
                 nodeId: node.id
-              });
+              }, gap, 'gap', 'itemSpacing'));
             }
           }
           
@@ -1063,13 +1173,13 @@ function Widget() {
                                      (boundVar as any).type === 'VARIABLE_ALIAS';
             
             if (!hasItemSpacingVar) {
-              unboundProperties.push({
+              unboundProperties.push(withSuggestion({
                 type: 'spacing',
                 property: 'Item Spacing',
                 currentValue: safeText(`${layoutNode.itemSpacing}px`),
                 nodePath: safeText(currentPath),
                 nodeId: node.id
-              });
+              }, layoutNode.itemSpacing, 'gap', 'itemSpacing'));
             }
           }
 
@@ -1089,13 +1199,13 @@ function Widget() {
                                      typeof boundVar === 'object' &&
                                      (boundVar as any).type === 'VARIABLE_ALIAS';
                 if (!hasPaddingVar) {
-                  unboundProperties.push({
+                  unboundProperties.push(withSuggestion({
                     type: 'spacing',
                     property: padding.name,
                     currentValue: safeText(`${padding.value}px`),
                     nodePath: safeText(currentPath),
                     nodeId: node.id
-                  });
+                  }, padding.value, 'padding', padding.key));
                 }
               }
             });
@@ -2089,7 +2199,10 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
               nodePath: (prop.nodePath || '').trim() || 'Unknown Path',
               nodeId: (prop.nodeId || '').trim() || undefined,
               ruleId: prop.ruleId || undefined,
-              fixRename: prop.fixRename || undefined
+              fixRename: prop.fixRename || undefined,
+              fixBindVariableId: prop.fixBindVariableId || undefined,
+              fixBindName: prop.fixBindName || undefined,
+              fixBindField: prop.fixBindField || undefined
             })) || [],
             // Ensure other optional properties have proper values
             componentSetName: component.componentSetName ? 
@@ -2329,7 +2442,23 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                         <Text fontSize={11} fill="#6A0000" width={110}>{safeProperty}:</Text>
                         <Text fontSize={11} fill="#6A0000" width="fill-parent">{safeCurrentValue}</Text>
                       </AutoLayout>
+                      {prop.fixBindName && (
+                        <Text fontSize={10} fill="#7A3E00" width="fill-parent">{`→ есть токен с этим значением: ${prop.fixBindName}`}</Text>
+                      )}
                     </AutoLayout>
+                    {prop.fixBindName && (
+                      <AutoLayout
+                        padding={{ vertical: 3, horizontal: 7 }}
+                        fill="#FFE2C4"
+                        stroke="#E8A968"
+                        strokeWidth={1}
+                        cornerRadius={6}
+                        onClick={() => applyFixBind(componentId, prop)}
+                        hoverStyle={{ fill: "#FFD199" }}
+                      >
+                        <Text fontSize={10} fill="#7A3E00" fontWeight={600}>Привязать</Text>
+                      </AutoLayout>
+                    )}
                     {prop.fixRename && (
                       <AutoLayout
                         padding={{ vertical: 3, horizontal: 7 }}
@@ -3165,6 +3294,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         }])
 
         buildSlugRegistry([currentPage])
+        await buildFloatTokenMap()
         const pageComponents = await processPageComponents(currentPage)
 
         setPageProgress([{
@@ -3199,6 +3329,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         }))
         setPageProgress(initialProgress)
         buildSlugRegistry(allPages)
+        await buildFloatTokenMap()
 
         let allComponents: ComponentAuditData[] = []
         
@@ -3327,6 +3458,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       const result: ComponentAuditData[] = []
 
       buildSlugRegistry([currentPage])
+      await buildFloatTokenMap()
 
       // Process each selected component
       for (const component of selectedComponents) {
