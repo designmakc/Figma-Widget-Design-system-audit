@@ -2222,12 +2222,10 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                   cornerRadius={8} 
                   stroke="#FFD6D6"
                   width="fill-parent"
-                  onClick={isOnCurrentPage ? () => navigateToComponent(componentId, targetNodeId) : undefined}
-                  hoverStyle={isOnCurrentPage ? { 
-                    fill: "#FFE5E5", 
-                    stroke: "#FFC1C1" 
-                  } : undefined}
                 >
+                  {/* Навигация — только на иконке-стрелке: клики вложенных кнопок всплывают
+                      к родителю, а stopPropagation в Widget API нет. Была на всей строке —
+                      «Игнор» / «Привязать» / «Исправить» уводили вьюпорт к узлу. */}
                   <AutoLayout direction="horizontal" spacing={8} width="fill-parent" verticalAlignItems="center">
                     <AutoLayout direction="vertical" spacing={4} width="fill-parent">
                       <AutoLayout direction="horizontal" spacing={8} width="fill-parent">
@@ -2280,7 +2278,15 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                       <Text fontSize={10} fill="#555555" fontWeight={600}>Игнор</Text>
                     </AutoLayout>
                     {isOnCurrentPage && (
-                      <AutoLayout width={20} height={20} horizontalAlignItems="center" verticalAlignItems="center">
+                      <AutoLayout
+                        width={24}
+                        height={24}
+                        cornerRadius={6}
+                        horizontalAlignItems="center"
+                        verticalAlignItems="center"
+                        onClick={() => navigateToComponent(componentId, targetNodeId)}
+                        hoverStyle={{ fill: "#FFE5E5", stroke: "#FFC1C1" }}
+                      >
                         <ExternalLinkIcon color="#6A0000" size={12} />
                       </AutoLayout>
                     )}
