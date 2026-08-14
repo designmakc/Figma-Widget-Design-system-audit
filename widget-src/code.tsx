@@ -1946,16 +1946,29 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     const targetNode = await figma.getNodeByIdAsync(targetNodeId)
     
     if (targetNode && 'x' in targetNode) {
+      // Кадр до прыжка — виджет в нём виден, поэтому возврат к нему и есть возврат к виджету
+      const prevCenter = { x: figma.viewport.center.x, y: figma.viewport.center.y }
+      const prevZoom = figma.viewport.zoom
+      const prevSelection = figma.currentPage.selection
+
       // Select the specific node (only SceneNodes can be selected)
       figma.currentPage.selection = [targetNode as SceneNode]
-      
+
       // Navigate to the specific node with comfortable zoom
       figma.viewport.scrollAndZoomIntoView([targetNode as SceneNode])
-      
+
       // Show notification with node name and return instruction
       const nodeName = specificNodeId ? targetNode.name : safeText(targetNode.name)
-      figma.notify(`${safeText(nodeName)} • Double-click widget layer to return`, {
-        timeout: 60000
+      figma.notify(`${safeText(nodeName)} • двойной клик по слою виджета — тоже возврат`, {
+        timeout: 300000,
+        button: {
+          text: '← К виджету',
+          action: () => {
+            figma.viewport.center = prevCenter
+            figma.viewport.zoom = prevZoom
+            figma.currentPage.selection = prevSelection
+          }
+        }
       })
     }
   } catch (error) {
