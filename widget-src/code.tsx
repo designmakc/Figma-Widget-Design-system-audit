@@ -32,6 +32,11 @@ interface UnboundProperty {
   fixBindField?: string       // ...to this bindable node field
 }
 
+// Единственное определение «что умеет чиниться само» — им пользуются и счётчик на кнопке,
+// и массовое применение, чтобы кнопка не обещала больше, чем сделает
+export const isAutoFixable = (p: UnboundProperty): boolean =>
+  Boolean((p.fixBindVariableId && p.fixBindField) || p.fixRename)
+
 interface ComponentAuditData {
   id: string
   name: string
@@ -808,6 +813,30 @@ const SelectionIcon = ({ color = "#2E7D32", size = 20 }: { color?: string, size?
   />
 )
 
+// Чекбокс выбора находки для массовых действий
+const Checkbox = ({ checked, onClick }: { checked: boolean, onClick: () => void }) => (
+  <AutoLayout
+    width={16}
+    height={16}
+    cornerRadius={4}
+    fill={checked ? "#1976D2" : "#FFFFFF"}
+    stroke={checked ? "#1976D2" : "#B9B9B9"}
+    strokeWidth={1}
+    horizontalAlignItems="center"
+    verticalAlignItems="center"
+    onClick={onClick}
+    hoverStyle={{ stroke: "#1976D2" }}
+  >
+    {checked && (
+      <SVG
+        src={`<svg width="10" height="10" viewBox="0 0 10 10" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M1.5 5.2 L3.8 7.4 L8.5 2.6" stroke="#FFFFFF" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>`}
+      />
+    )}
+  </AutoLayout>
+)
+
 // Component Set Icon (Dashed border frame with center diamond)
 const ComponentSetIcon = ({ color = "#000000", size = 16 }: { color?: string, size?: number }) => (
   <SVG 
@@ -990,33 +1019,89 @@ function Widget() {
     }
   }
 
-  const removeFindingFromAudit = (key: string) => {
+  // Пачкой, а не по одной: setState в цикле работает со старым замыканием — правки затирают друг друга
+  const removeFindingsFromAudit = (keys: string[]) => {
+    if (keys.length === 0) return
     setAuditData(auditData.map(c => {
-      const rest = c.unboundProperties.filter(p => findingKey(p) !== key)
+      const rest = c.unboundProperties.filter(p => keys.indexOf(findingKey(p)) === -1)
       if (rest.length === c.unboundProperties.length) return c
       return { ...c, unboundProperties: rest, hasUnboundProperties: rest.length > 0 }
     }))
   }
 
-  const applyFixBind = async (componentId: string, prop: UnboundProperty) => {
-    if (!prop.fixBindVariableId || !prop.fixBindField || !prop.nodeId) return
+  const removeFindingFromAudit = (key: string) => removeFindingsFromAudit([key])
+
+  // Выбор находок для массовых действий (ключи те же, что у игнора)
+  const [selectedFindings, setSelectedFindings] = useSyncedState<string[]>('selectedFindings', [])
+
+  const toggleSelectFinding = (prop: UnboundProperty) => {
+    const key = findingKey(prop)
+    if (selectedFindings.indexOf(key) === -1) {
+      setSelectedFindings([...selectedFindings, key])
+    } else {
+      setSelectedFindings(selectedFindings.filter(k => k !== key))
+    }
+  }
+
+  const setSelection = (keys: string[], on: boolean) => {
+    if (on) {
+      const next = selectedFindings.slice()
+      for (const k of keys) if (next.indexOf(k) === -1) next.push(k)
+      setSelectedFindings(next)
+    } else {
+      setSelectedFindings(selectedFindings.filter(k => keys.indexOf(k) === -1))
+    }
+  }
+
+  const bulkIgnore = (props: UnboundProperty[]) => {
+    if (props.length === 0) return
+    const keys = props.map(findingKey)
+    const next = ignoredFindings.slice()
+    for (const k of keys) if (next.indexOf(k) === -1) next.push(k)
+    setIgnoredFindings(next)
+    setSelectedFindings(selectedFindings.filter(k => keys.indexOf(k) === -1))
+    figma.notify(`🙈 В игнор: ${keys.length}`)
+  }
+
+  const bulkFix = async (props: UnboundProperty[]) => {
+    const fixable = props.filter(isAutoFixable)
+    if (fixable.length === 0) {
+      figma.notify('Среди выбранных нет находок с авто-фиксом')
+      return
+    }
+    const fixedKeys: string[] = []
+    let failed = 0
+    for (const prop of fixable) {
+      const ok = prop.fixBindVariableId && prop.fixBindField
+        ? Boolean(await bindPropToVariable(prop))
+        : await renamePropNode(prop)
+      if (ok) fixedKeys.push(findingKey(prop))
+      else failed++
+    }
+    removeFindingsFromAudit(fixedKeys)
+    setSelectedFindings(selectedFindings.filter(k => fixedKeys.indexOf(k) === -1))
+    const skipped = props.length - fixable.length
+    const tail = [
+      failed > 0 ? `не вышло: ${failed}` : '',
+      skipped > 0 ? `без авто-фикса: ${skipped}` : ''
+    ].filter(Boolean).join(', ')
+    figma.notify(`✅ Исправлено: ${fixedKeys.length}${tail ? ` • ${tail}` : ''}`, { error: failed > 0 })
+  }
+
+  // Правка в Figma без notify и без setState — чтобы годилась и для одиночного, и для массового применения
+  const bindPropToVariable = async (prop: UnboundProperty): Promise<string | null> => {
+    if (!prop.fixBindVariableId || !prop.fixBindField || !prop.nodeId) return null
     try {
       const node: any = await figma.getNodeByIdAsync(prop.nodeId)
       const variable = await figma.variables.getVariableByIdAsync(prop.fixBindVariableId)
-      if (!node || !variable) {
-        figma.notify('❌ Узел или переменная не найдены — пересканируйте')
-        return
-      }
+      if (!node || !variable) return null
       const paintMatch = /^(fills|strokes)\[(\d+)\]$/.exec(prop.fixBindField)
       if (paintMatch) {
         // Paints are rebound through the paint object, not setBoundVariable
         const paintField = paintMatch[1]
         const paintIndex = Number(paintMatch[2])
         const paints = node[paintField]
-        if (!Array.isArray(paints) || !paints[paintIndex]) {
-          figma.notify('❌ Заливка изменилась — пересканируйте')
-          return
-        }
+        if (!Array.isArray(paints) || !paints[paintIndex]) return null   // заливка изменилась после скана
         const next = paints.slice()
         next[paintIndex] = figma.variables.setBoundVariableForPaint(next[paintIndex], 'color', variable)
         node[paintField] = next
@@ -1028,29 +1113,43 @@ function Widget() {
       } else {
         node.setBoundVariable(prop.fixBindField, variable)
       }
-      removeFindingFromAudit(findingKey(prop))
-      figma.notify(`✅ Привязан «${variable.name}»`)
+      return variable.name
     } catch (e) {
       console.error('Error applying bind fix:', e)
-      figma.notify('❌ Не удалось привязать переменную', { error: true })
+      return null
     }
   }
 
-  const applyFixRename = async (componentId: string, prop: UnboundProperty) => {
-    if (!prop.fixRename || !prop.nodeId) return
+  const renamePropNode = async (prop: UnboundProperty): Promise<boolean> => {
+    if (!prop.fixRename || !prop.nodeId) return false
     try {
       const node = await figma.getNodeByIdAsync(prop.nodeId)
-      if (!node) {
-        figma.notify('❌ Узел не найден — пересканируйте')
-        return
-      }
+      if (!node) return false
       node.name = prop.fixRename
-      removeFindingFromAudit(findingKey(prop))
-      figma.notify(`✅ Переименовано: «${prop.fixRename}»`)
+      return true
     } catch (e) {
-      console.error('Error applying fix:', e)
-      figma.notify('❌ Не удалось переименовать (узел заблокирован?)', { error: true })
+      console.error('Error applying rename fix:', e)
+      return false
     }
+  }
+
+  const applyFixBind = async (componentId: string, prop: UnboundProperty) => {
+    const boundName = await bindPropToVariable(prop)
+    if (!boundName) {
+      figma.notify('❌ Не удалось привязать переменную — пересканируйте', { error: true })
+      return
+    }
+    removeFindingFromAudit(findingKey(prop))
+    figma.notify(`✅ Привязан «${boundName}»`)
+  }
+
+  const applyFixRename = async (componentId: string, prop: UnboundProperty) => {
+    if (!await renamePropNode(prop)) {
+      figma.notify('❌ Не удалось переименовать (узел заблокирован?)', { error: true })
+      return
+    }
+    removeFindingFromAudit(findingKey(prop))
+    figma.notify(`✅ Переименовано: «${prop.fixRename}»`)
   }
 
   const getNodePath = (node: SceneNode, rootNode: SceneNode): string => {
@@ -2220,15 +2319,85 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       unknown: '❓ Неизвестный тип'
     }
 
+    const allKeys = filteredProperties.map(findingKey)
+    const selectedProps = filteredProperties.filter(p => selectedFindings.indexOf(findingKey(p)) !== -1)
+    const allSelected = selectedProps.length === filteredProperties.length && filteredProperties.length > 0
+    const fixableCount = selectedProps.filter(isAutoFixable).length
+
     return (
       <AutoLayout direction="vertical" spacing={12} width="fill-parent" padding={{ bottom: 12 }}>
-        <Text fontSize={12} fontWeight={600} fill="#000">Свойства без переменных/стилей</Text>
-        
-        {Object.keys(groupedProperties).map((type, typeIndex) => (
-          <AutoLayout key={`type-${type}-${typeIndex}`} direction="vertical" spacing={8} width="fill-parent">
-            <Text fontSize={11} fontWeight={600} fill="#000">
-              {typeLabels[type as keyof typeof typeLabels] || safeText(`Unknown Type (${type})`)}
+        <AutoLayout direction="horizontal" spacing={8} width="fill-parent" verticalAlignItems="center">
+          <Text fontSize={12} fontWeight={600} fill="#000" width="fill-parent">Свойства без переменных/стилей</Text>
+          <Checkbox checked={allSelected} onClick={() => setSelection(allKeys, !allSelected)} />
+          <Text fontSize={10} fill="#666" onClick={() => setSelection(allKeys, !allSelected)}>
+            {allSelected ? 'Снять все' : `Выбрать все (${safeText(String(filteredProperties.length))})`}
+          </Text>
+        </AutoLayout>
+
+        {selectedProps.length > 0 && (
+          <AutoLayout
+            direction="horizontal"
+            spacing={8}
+            width="fill-parent"
+            verticalAlignItems="center"
+            padding={{ vertical: 6, horizontal: 10 }}
+            fill="#F1F6FF"
+            stroke="#C7DBFF"
+            cornerRadius={8}
+          >
+            <Text fontSize={11} fill="#1A3E6E" fontWeight={600} width="fill-parent">
+              {`Выбрано: ${safeText(String(selectedProps.length))}`}
             </Text>
+            {fixableCount > 0 && (
+              <AutoLayout
+                padding={{ vertical: 3, horizontal: 7 }}
+                fill="#FFE2C4"
+                stroke="#E8A968"
+                strokeWidth={1}
+                cornerRadius={6}
+                onClick={() => bulkFix(selectedProps)}
+                hoverStyle={{ fill: "#FFD199" }}
+              >
+                <Text fontSize={10} fill="#7A3E00" fontWeight={600}>
+                  {`Исправить (${safeText(String(fixableCount))})`}
+                </Text>
+              </AutoLayout>
+            )}
+            <AutoLayout
+              padding={{ vertical: 3, horizontal: 7 }}
+              fill="#EFEFEF"
+              stroke="#D5D5D5"
+              strokeWidth={1}
+              cornerRadius={6}
+              onClick={() => bulkIgnore(selectedProps)}
+              hoverStyle={{ fill: "#E0E0E0" }}
+            >
+              <Text fontSize={10} fill="#555555" fontWeight={600}>
+                {`Игнор (${safeText(String(selectedProps.length))})`}
+              </Text>
+            </AutoLayout>
+            <AutoLayout
+              padding={{ vertical: 3, horizontal: 7 }}
+              cornerRadius={6}
+              onClick={() => setSelection(allKeys, false)}
+              hoverStyle={{ fill: "#E3ECFB" }}
+            >
+              <Text fontSize={10} fill="#1A3E6E" fontWeight={600}>Снять выбор</Text>
+            </AutoLayout>
+          </AutoLayout>
+        )}
+
+        {Object.keys(groupedProperties).map((type, typeIndex) => {
+          const groupKeys = (groupedProperties[type] || []).map(findingKey)
+          const groupAllSelected = groupKeys.every(k => selectedFindings.indexOf(k) !== -1)
+          return (
+          <AutoLayout key={`type-${type}-${typeIndex}`} direction="vertical" spacing={8} width="fill-parent">
+            <AutoLayout direction="horizontal" spacing={6} width="fill-parent" verticalAlignItems="center">
+              <Checkbox checked={groupAllSelected} onClick={() => setSelection(groupKeys, !groupAllSelected)} />
+              <Text fontSize={11} fontWeight={600} fill="#000" width="fill-parent">
+                {typeLabels[type as keyof typeof typeLabels] || safeText(`Unknown Type (${type})`)}
+              </Text>
+            </AutoLayout>
             <AutoLayout direction="vertical" spacing={8} width="fill-parent">
             {(groupedProperties[type] || []).map((prop, index) => {
               const safeProperty = safeText(prop.property)
@@ -2251,6 +2420,10 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                       к родителю, а stopPropagation в Widget API нет. Была на всей строке —
                       «Игнор» / «Привязать» / «Исправить» уводили вьюпорт к узлу. */}
                   <AutoLayout direction="horizontal" spacing={8} width="fill-parent" verticalAlignItems="center">
+                    <Checkbox
+                      checked={selectedFindings.indexOf(findingKey(prop)) !== -1}
+                      onClick={() => toggleSelectFinding(prop)}
+                    />
                     <AutoLayout direction="vertical" spacing={4} width="fill-parent">
                       <AutoLayout direction="horizontal" spacing={8} width="fill-parent">
                         <Text fontSize={11} fill="#6A0000" width={110}>{safeProperty}:</Text>
@@ -2320,7 +2493,8 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
             })}
             </AutoLayout>
           </AutoLayout>
-        ))}
+          )
+        })}
       </AutoLayout>
     )
     } catch (error) {

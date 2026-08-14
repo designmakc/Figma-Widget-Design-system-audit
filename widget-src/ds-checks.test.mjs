@@ -31,8 +31,19 @@ const src = Buffer.from(built.outputFiles[0].text).toString('base64')
 const {
   dsIsSemanticCollection, dsColorKey, dsCollectBindings,
   dsIsInSubComponentSection, dsSplitHiddenPrefix,
-  DS_LAYOUT_NAMESPACE, DS_LAYOUT_ROOTLESS
+  DS_LAYOUT_NAMESPACE, DS_LAYOUT_ROOTLESS,
+  isAutoFixable
 } = await import('data:text/javascript;base64,' + src)
+
+test('авто-фикс обещается только там, где есть чем чинить', () => {
+  // привязка переменной: нужны и id, и поле — иначе счётчик на кнопке соврёт
+  assert.equal(isAutoFixable({ fixBindVariableId: 'VariableID:1:2', fixBindField: 'itemSpacing' }), true)
+  assert.equal(isAutoFixable({ fixBindVariableId: 'VariableID:1:2' }), false)
+  assert.equal(isAutoFixable({ fixBindField: 'itemSpacing' }), false)
+
+  assert.equal(isAutoFixable({ fixRename: 'iconWrapper' }), true)
+  assert.equal(isAutoFixable({ type: 'fill', property: 'Fill' }), false)
+})
 
 test('только semantic-коллекции проходят', () => {
   assert.equal(dsIsSemanticCollection('semantic'), true)
