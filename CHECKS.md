@@ -1,12 +1,12 @@
 # Реестр проверок DS Audit
 
-Живой документ: что проверяет виджет, откуда правило, статус реализации. Обновлять при каждом добавлении/изменении проверки. Источник правил — DS-репо `docs/rules/` (rules v1.3.0, 2026-07-22).
+Живой документ: что проверяет виджет, откуда правило, статус реализации. Обновлять при каждом добавлении/изменении проверки. Источник правил — DS-репо `docs/rules/` (**rules v1.10.1**, 2026-08-12) и словарь токенов `tokens/current` (**tokens v4.0.0**, 2026-08-12), сверено с живым `Base` 2026-08-13.
 
 Все находки DS-правил выводятся в группе «🚨 Нарушения правил ДС» с `ruleId`; каждое правило отключается тумблером в Настройки → Отдельные свойства.
 
 **Действия на находке:** «Игнор» — скрыть конкретное замечание (список персистентный, сброс — «Сбросить игноры (N)» в настройках); «Исправить» — авто-фикс, есть у переименований (`layer-naming-camelcase` → camelCase, `component-name-pascalcase` → PascalCase): переименовывает узел прямо в Figma; «Привязать» — на unbound-находках числовых свойств, когда в semantic-коллекциях есть FLOAT-токен с точно таким значением (подсказка «→ есть токен с этим значением: …»): привязывает переменную к свойству.
 
-**Подсказка токена («Привязать»):** карта значение→токен строится на старте скана из local FLOAT-переменных (алиасы резолвятся до 4 уровней; коллекции `device` и `primitive*` исключены — биндим только public-слой). Категория токена согласована с `spacing-category-property-match`: gap-свойства ← только `*/gap/*`, padding ← `*/padding/*`, радиусы ← `radius/*`, толщина обводки ← `borderWidth/*`. При нескольких кандидатах берётся кратчайшее имя. `cornerRadius` (unified) биндится на все четыре угла. Ограничение: значение сверяется по default-mode коллекции — если узел живёт в другом device/brand-mode с иным значением, подсказки не будет.
+**Подсказка токена («Привязать»):** карты значение→токен строятся на старте скана из local-переменных FLOAT и COLOR (алиасы резолвятся до 4 уровней; берутся **только** semantic-коллекции — `semantic`, `semanticV2`; `device`, `isloading`, `primitive*` исключены). Категория токена согласована с `spacing-category-property-match`: gap-свойства ← только `*/gap/*`, padding ← `*/padding/*`, радиусы ← `radius/*`, толщина обводки ← `borderWidth/*`. При нескольких кандидатах берётся кратчайшее имя. `cornerRadius` (unified) биндится на все четыре угла. Ограничение: значение сверяется по default-mode коллекции — если узел живёт в другом device/brand-mode с иным значением, подсказки не будет.
 
 ## 1. Базовые unbound-проверки (унаследованы от Component Audit, MIT)
 
@@ -31,14 +31,16 @@
 | ruleId | Источник | Enforcement | Что ловит |
 |---|---|---|---|
 | `spacing-category-property-match` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard | gap-свойства (`itemSpacing`, `counterAxisSpacing`, `gap`) с токеном `*/padding/*` или `*/margin/*`; padding-свойства с `*/gap/*` |
-| `spacing-layout-vocabulary` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard | `layout/`-токен вне закрытого словаря `layout/{page/margin\|container/padding\|content/gap}/{horizontal\|vertical}`, `layout/grid/gutter` — ловит дореформенные имена (`layout/page/vertical`, `layout/content/paddingX`) |
+| `spacing-layout-vocabulary` | `docs/rules/tokens/naming.md` → `token-name-variability-namespace`, v1.10.1 | hard | **второй** сегмент раскладочного токена обязан быть источником изменчивости: `layout/{container\|page\|card}/…`. Ловит дореформенные ветки (`layout/page/margin/*`, `layout/section/*`, `layout/content/*`) и раскладочные токены, оставшиеся без корня `layout/` (`container/padding/*` — схема 1.10.0, прожила один день). Проверяется **только на semantic**: внутри `device`/`container` те же токены живут с укороченными именами (`layout/page/*`, `layout/gap/*`) — это фасадные ветки, а не нарушение |
 | `spacing-region-scope` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard (в виджете — «на ревью») | `layout/page/*` внутри компонента; легален только для позиционирования полноэкранного оверлея от вьюпорта — машинно не различить, поэтому формулировка «проверить» |
-| `spacing-bind-semantic-layer` | `docs/rules/tokens/spacing.md`, v1.3.0 | hard | прямая привязка переменной из коллекции `device`; исключения by design: `visible/*`, `system/device` |
+| `spacing-bind-semantic-layer` | `docs/rules/tokens/tier-discipline.md` + `spacing.md`, v1.3.0 | hard | привязка переменной из **любой** не-semantic коллекции (живые на 2026-08-13: `device`, `container`, `isloading`, `primitive`); исключения by design: BOOLEAN-переменные (переключатели `system/visible/*`, `isloading/skeleton/*`), STRING-мосты `system/device` / `device`, привязки на `componentProperties.*` (мост «мода → variant property»), служебные коллекции плагина uSpec `Specs` / `Specs Layout` |
 | `tier-discipline` | `docs/rules/tokens/tier-discipline.md` | soft | привязка primitive-токена (коллекция `primitive*` или путь `primitive/*`) вместо semantic-слоя |
 | `tokens-no-component-tier` | `docs/rules/tokens/tier-discipline.md`, DEC-014 | soft | middle-segment имени токена совпадает с именем component-set из сканируемых страниц (реестр слагов строится на старте скана) |
 | `gradient-stop-unbound` | `docs/rules/tokens/gradients.md`, DEC-036 | hard | стоп градиента (fill/stroke) без привязанной переменной цвета |
 
-Универсальные проверки (`spacing-bind-semantic-layer`, `tier-discipline`, DEC-024, DEC-014) применяются ко **всем** привязкам: spacing, fills, strokes, радиусы, strokeWeight, opacity.
+Универсальные проверки (`spacing-bind-semantic-layer`, `tier-discipline`, DEC-014) применяются ко **всем** привязкам узла: `boundVariables` обходится целиком (`dsCollectBindings`) — массивы (`fills`, `strokes`, `effects`), одиночные алиасы (spacing, радиусы, `strokeWeight`, `opacity`, типографика) и карты (`componentProperties`). Списка полей больше нет: раньше текстовые, эффектные и размерные привязки молча не проверялись.
+
+**Семантическая замена (2026-08-12).** Находка `spacing-bind-semantic-layer` / `tier-discipline` несёт кнопку «Привязать», если в semantic-коллекциях есть токен с тем же значением: для FLOAT — по значению и категории свойства, для COLOR — по 8-битной подписи RGBA. Замена применяется на месте: числовые поля через `setBoundVariable`, заливки и обводки через `setBoundVariableForPaint` (поле находки — `fills[0]` / `strokes[0]`).
 
 ## 3. Naming-проверки (A-блок, 2026-07-23)
 
@@ -46,10 +48,11 @@
 
 | ruleId | Источник | Enforcement | Что ловит |
 |---|---|---|---|
-| `component-name-pascalcase` | `docs/rules/components/component-name.md`, DEC-032 | hard | имя component-set / standalone-компонента не PascalCase (`^[A-Z][a-zA-Z0-9]*$`): camelCase, пробелы, kebab, underscore |
+| `component-name-pascalcase` | `docs/rules/components/component-name.md`, DEC-032 | hard | имя component-set / standalone-компонента не PascalCase (`^[A-Z][a-zA-Z0-9]*$`): camelCase, пробелы, kebab, underscore. **Не применяется** к компонентам в секции `subComponent` — там действует правило ниже |
+| `subcomponent-name-lowercase` | `docs/rules/component-rule/naming.md` → `ASM-026`, уточнено 2026-08-13 | hard | компонент лежит в секции `SubComponent` / `_SubComponent` / `Subcomponent`, но имя начинается с заглавной. Префикс публикации (`.`, `_`) отделяется до проверки: `_stack` валиден, `_Processed` — нет. Авто-фикс «Исправить» переименовывает в camelCase, префикс сохраняется |
 | `component-property-camelcase` | `docs/rules/components/properties.md`, DEC-007 | hard | имя свойства не camelCase (`^[a-z][a-zA-Z0-9]*$`); `#id`-суффикс Figma отрезается до проверки |
 | `boolean-prefix-convention` | `docs/rules/components/boolean-prefix.md`, DEC-031 | hard | boolean-свойство (BOOLEAN или VARIANT с options `true/false`) без префикса `is*`/`has*`; `show*` — отдельная подсказка «переименовать в has*» |
-| `component-property-tier1-glossary` | `docs/rules/components/property-glossary.md`, DEC-025 | soft | анти-имена осей: `style`→`variant`, `buttonSize`→`size`, `level`/`weight`→`priority`, `status`/`mode`→`state`, `side`→`labelPosition`; values осей `variant` (⊆ solid\|outline\|ghost\|unstyled) и `labelPosition` (⊆ left\|right) вне канона |
+| `component-property-tier1-glossary` | `docs/rules/components/property-glossary.md`, DEC-025 | soft | анти-имена осей: `style`→`variant`, `buttonSize`→`size`, `level`/`weight`→`priority`, `status`/`mode`→`state`, `side`→`labelPosition`; values осей `variant` (⊆ solid\|outline\|ghost\|unstyled), `labelPosition` (⊆ left\|right) и `priority` (⊆ neutral\|1\|2\|3\|4\|inverse) вне канона glossary v2 |
 | `state-axis-canonical-enum` | `docs/rules/components/states.md`, DEC-030 | soft | значения оси `state` вне канонического enum `default\|hover\|focus\|empty\|filled\|loading\|success\|error\|disabled` |
 | `layer-naming-camelcase` | `docs/rules/components/layers.md`, DEC-008 | hard | имя слоя не camelCase. Пропускаются: INSTANCE (имя от master-компонента — норма), TEXT с `autoRename` (авто-имя из контента) |
 
@@ -57,9 +60,13 @@
 
 - **Стопы градиентов**: проверяется только факт привязки, без префикса `color/gradient/*` — живые переменные пока без `color/`-префикса (rename pending, DEC-036). Добавить проверку префикса после rename.
 - **`spacing-region-scope`**: `layout/page/*` на Viewport-обёртке полноэкранного оверлея легален — виджет не различает, флажит как «проверить».
-- **`tokens-no-component-tier`**: реестр слагов — только component-set'ы сканируемых страниц; при скане одной страницы токен с именем компонента с другой страницы не поймается.
+- **`tokens-no-component-tier`**: реестр слагов — только component-set'ы текущей страницы (скана всего файла больше нет); токен с именем компонента с другой страницы не поймается.
+- **Семантическая замена**: карты токенов строятся из **local**-переменных — в файле-потребителе, где semantic подключена как библиотека, замена не предложится (сама находка останется). Значение сверяется в default-моде коллекции: токен, различающийся только по бренду/девайсу, не подберётся.
+- **Коллекция не резолвится** (remote-переменная): проверка «не-semantic коллекция» пропускается, остаётся только детект по имени `primitive/*` — иначе легальные библиотечные привязки давали бы ложные срабатывания пачками.
 - **`layer-naming-camelcase`**: внутрь INSTANCE не заходим (внутренности — зона master-компонента). Дефолтные Figma-имена (`Frame 123`, `Ellipse 1`) — валидные нарушения по правилу, но их может быть много: тумблер «Имена слоёв» позволяет отключить.
 - **`size`-ось не проверяется** на канон values: enum расширяемый (`lg|md|sm`, DEC-025), закрытого списка нет.
+- **`subcomponent-name-lowercase`** — зеркало `ASM-026` из ветки сборки; тот же признак проверяет ревизор `audit-assembly.js` → `subComponentNameLower`. Признак «техническое» — секция, а не casing: до уточнения проверка спрашивала у нарушения, нарушение ли оно.
+- **Словарь `layout/` проверяется по схеме, не по перечню.** Виджет не хранит список из 36 живых имён — только требование ко второму сегменту. Новый лист (`layout/container/foo`) не потребует правки виджета; переезд ветки — потребует.
 - **Grid auto-layout**: `itemSpacing`/`gap` не проверяются вовсе (и unbound, и semantic-fit) — Figma хранит там устаревшие flow-значения.
 
 ## 4. Используемые компоненты (информационный блок, 2026-07-24)

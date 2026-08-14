@@ -63,17 +63,6 @@ interface PageData {
   displayedCount: number
 }
 
-interface QuickScanData {
-  totalPages: number
-  pagesWithComponents: number
-  uniqueComponents: number
-  totalVariants: number
-  withoutDescription: number
-  withoutDocs: number
-  totalUnboundProperties: number
-  hiddenComponents: number
-}
-
 // ============================================================================
 // DS token semantic-fit checks (Genlab DS rules v1.3.0, docs/rules/tokens/*)
 // Beyond "bound or not": verifies a bound variable is the RIGHT token for the
@@ -81,9 +70,16 @@ interface QuickScanData {
 // ============================================================================
 
 interface ResolvedVar {
+  id: string          // variable id — needed to resolve its value for a replacement lookup
   name: string        // variable name, e.g. "layout/container/padding/vertical"
   collection: string  // collection name, e.g. "semantic" / "device" / "primitive"
+  resolvedType: string // 'FLOAT' | 'COLOR' | 'BOOLEAN' | 'STRING'
 }
+
+// Only the semantic layer is bindable from components: primitive is the raw
+// scale, device/isloading are hidden engines. Tolerates "semanticV2"-style names.
+export const dsIsSemanticCollection = (collection: string): boolean =>
+  (collection || '').toLowerCase().indexOf('semantic') === 0
 
 // Variable ids repeat heavily across components — resolve each id once per session.
 const dsVarCache = new Map<string, ResolvedVar | null>()
@@ -101,7 +97,7 @@ const resolveBoundVar = async (id: string): Promise<ResolvedVar | null> => {
       } catch (e) {
         // Remote (library) collections may not resolve — variable name alone still usable
       }
-      resolved = { name: v.name, collection }
+      resolved = { id, name: v.name, collection, resolvedType: String(v.resolvedType || '') }
     }
   } catch (e) {
     // Unresolvable id — treat as unknown, never crash the scan
@@ -126,12 +122,15 @@ const buildSlugRegistry = (pages: PageNode[]) => {
 }
 
 // ---------------------------------------------------------------------------
-// Token suggestions: value → FLOAT-token map, built once per scan.
-// Enables "Привязать" auto-fix on unbound numeric findings.
+// Token suggestions: value → semantic-token maps, built once per scan.
+// Enables "Привязать" auto-fix on unbound findings and semantic replacements
+// on findings bound to a non-semantic token.
 // ---------------------------------------------------------------------------
 
 interface DsFloatToken { value: number; id: string; name: string; collection: string }
+interface DsColorToken { key: string; id: string; name: string }
 let dsFloatTokens: DsFloatToken[] = []
+let dsColorTokens: DsColorToken[] = []
 
 const dsResolveFloatValue = async (varObj: any, depth: number): Promise<number | null> => {
   if (!varObj || depth > 4) return null
@@ -152,26 +151,58 @@ const dsResolveFloatValue = async (varObj: any, depth: number): Promise<number |
   return null
 }
 
-const buildFloatTokenMap = async () => {
-  dsFloatTokens = []
+const dsResolveColorValue = async (varObj: any, depth: number): Promise<any> => {
+  if (!varObj || depth > 4) return null
+  let col: any = null
   try {
-    const vars = await figma.variables.getLocalVariablesAsync('FLOAT')
+    col = await figma.variables.getVariableCollectionByIdAsync(varObj.variableCollectionId)
+  } catch (e) { /* remote collection */ }
+  if (!col) return null
+  const modeId = col.defaultModeId || (col.modes && col.modes[0] && col.modes[0].modeId)
+  const raw = varObj.valuesByMode ? varObj.valuesByMode[modeId] : undefined
+  if (raw && typeof raw === 'object' && (raw as any).type === 'VARIABLE_ALIAS') {
+    try {
+      const next = await figma.variables.getVariableByIdAsync((raw as any).id)
+      return dsResolveColorValue(next, depth + 1)
+    } catch (e) { return null }
+  }
+  if (raw && typeof raw === 'object' && typeof (raw as any).r === 'number') return raw
+  return null
+}
+
+// 8-bit signature of an RGBA colour — the lookup key of the colour-token map
+export const dsColorKey = (c: any): string =>
+  [c.r, c.g, c.b, c.a === undefined ? 1 : c.a].map((n: number) => Math.round(n * 255)).join(',')
+
+// ponytail: values are read in the collection's default mode only — a multi-brand
+// exact match would need per-mode diffing and gives no better suggestion.
+const buildTokenMaps = async () => {
+  dsFloatTokens = []
+  dsColorTokens = []
+  try {
     const collections = await figma.variables.getLocalVariableCollectionsAsync()
     const colById: Record<string, any> = {}
     collections.forEach(c => { colById[c.id] = c })
-    for (const v of vars) {
+
+    const floats = await figma.variables.getLocalVariablesAsync('FLOAT')
+    for (const v of floats) {
       const col = colById[v.variableCollectionId]
-      if (!col) continue
-      const colName = (col.name || '').toLowerCase()
-      // device — hidden engine (bind semantic), primitives — not for direct binding
-      if (colName === 'device' || colName.indexOf('primitive') === 0) continue
+      if (!col || !dsIsSemanticCollection(col.name)) continue
       const value = await dsResolveFloatValue(v, 0)
       if (value !== null) {
         dsFloatTokens.push({ value, id: v.id, name: v.name, collection: col.name })
       }
     }
+
+    const colors = await figma.variables.getLocalVariablesAsync('COLOR')
+    for (const v of colors) {
+      const col = colById[v.variableCollectionId]
+      if (!col || !dsIsSemanticCollection(col.name)) continue
+      const rgba = await dsResolveColorValue(v, 0)
+      if (rgba) dsColorTokens.push({ key: dsColorKey(rgba), id: v.id, name: v.name })
+    }
   } catch (e) {
-    console.error('Error building float token map:', e)
+    console.error('Error building token maps:', e)
   }
 }
 
@@ -193,6 +224,87 @@ const dsSuggestToken = (value: number, category: string): DsFloatToken | null =>
   return candidates[0]
 }
 
+const dsSuggestColorToken = (key: string): DsColorToken | null => {
+  const candidates = dsColorTokens.filter(t => t.key === key)
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => a.name.length - b.name.length)
+  return candidates[0]
+}
+
+// Bindable node field → token category, so a replacement never violates
+// spacing-category-property-match
+const DS_FIELD_CATEGORY: Record<string, string> = {
+  itemSpacing: 'gap', counterAxisSpacing: 'gap', gap: 'gap',
+  paddingTop: 'padding', paddingRight: 'padding', paddingBottom: 'padding', paddingLeft: 'padding',
+  cornerRadius: 'radius', topLeftRadius: 'radius', topRightRadius: 'radius',
+  bottomLeftRadius: 'radius', bottomRightRadius: 'radius',
+  strokeWeight: 'borderWidth', strokeTopWeight: 'borderWidth', strokeRightWeight: 'borderWidth',
+  strokeBottomWeight: 'borderWidth', strokeLeftWeight: 'borderWidth'
+}
+const DS_PAINT_FIELDS = ['fills', 'strokes']
+
+interface DsFix { fixBindVariableId: string; fixBindName: string; fixBindField: string }
+
+// Which semantic token carries the same value as the wrongly bound one
+const dsSuggestSemanticFix = async (v: ResolvedVar, field: string, index: number | null): Promise<DsFix | null> => {
+  try {
+    const varObj = await figma.variables.getVariableByIdAsync(v.id)
+    if (!varObj) return null
+
+    if (v.resolvedType === 'COLOR') {
+      if (DS_PAINT_FIELDS.indexOf(field) === -1) return null
+      const rgba = await dsResolveColorValue(varObj, 0)
+      if (!rgba) return null
+      const hit = dsSuggestColorToken(dsColorKey(rgba))
+      if (!hit) return null
+      return {
+        fixBindVariableId: hit.id,
+        fixBindName: hit.name,
+        fixBindField: index === null ? field : `${field}[${index}]`
+      }
+    }
+
+    if (v.resolvedType === 'FLOAT') {
+      const category = DS_FIELD_CATEGORY[field]
+      if (!category) return null
+      const value = await dsResolveFloatValue(varObj, 0)
+      if (value === null) return null
+      const hit = dsSuggestToken(value, category)
+      if (!hit) return null
+      return { fixBindVariableId: hit.id, fixBindName: hit.name, fixBindField: field }
+    }
+  } catch (e) {
+    // Suggestion is best-effort — a finding without a fix is still a finding
+  }
+  return null
+}
+
+// Every bound variable of a node, whatever the field: arrays (fills/strokes/effects),
+// plain aliases (spacing, radii) and maps (componentProperties). Explicit lists would
+// silently miss text, effect and size bindings.
+export const dsCollectBindings = (bv: any): { field: string; index: number | null; id: string }[] => {
+  const out: { field: string; index: number | null; id: string }[] = []
+  const push = (field: string, index: number | null, a: any) => {
+    if (a && a.type === 'VARIABLE_ALIAS' && a.id) out.push({ field, index, id: a.id })
+  }
+  for (const key of Object.keys(bv || {})) {
+    const val = bv[key]
+    if (!val || typeof val !== 'object') continue
+    if (Array.isArray(val)) {
+      val.forEach((a: any, i: number) => push(key, i, a))
+    } else if (val.type === 'VARIABLE_ALIAS') {
+      push(key, null, val)
+    } else {
+      for (const sub of Object.keys(val)) {
+        const inner = val[sub]
+        if (Array.isArray(inner)) inner.forEach((a: any, i: number) => push(`${key}.${sub}`, i, a))
+        else push(`${key}.${sub}`, null, inner)
+      }
+    }
+  }
+  return out
+}
+
 const DS_GAP_PROPS = ['itemSpacing', 'counterAxisSpacing', 'gap']
 const DS_PADDING_PROPS = ['paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft']
 const DS_SPACING_PROP_LABELS: Record<string, string> = {
@@ -204,8 +316,29 @@ const DS_SPACING_PROP_LABELS: Record<string, string> = {
   paddingBottom: 'Padding Bottom',
   paddingLeft: 'Padding Left'
 }
-// Closed layout/ vocabulary (spacing-layout-vocabulary, rules v1.3.0)
-const DS_LAYOUT_VOCAB = /^layout\/(page\/margin\/(horizontal|vertical)|container\/padding\/(horizontal|vertical)|content\/gap\/(horizontal|vertical)|grid\/gutter)$/
+const DS_FIELD_LABELS: Record<string, string> = {
+  fills: 'Fill',
+  strokes: 'Stroke Color',
+  strokeWeight: 'Stroke Weight',
+  cornerRadius: 'Corner Radius',
+  effects: 'Effect',
+  opacity: 'Opacity'
+}
+// token-name-variability-namespace (rules v1.10.1, tokens v4.0.0): раскладочные
+// токены живут под общим корнем layout/, ВТОРОЙ сегмент отвечает «от чего зависит
+// значение»: container — тир, page — девайс, card — константа. Дальше свободное имя
+// свойства или объекта, поэтому проверяется схема, а не перечень листьев.
+export const DS_LAYOUT_NAMESPACE = /^layout\/(container|page|card)\/[a-zA-Z0-9]/
+// Дореформенные ветки словаря 1.3.0 → чем заменены (удалены из Base 2026-08-08/12)
+const DS_LAYOUT_LEGACY: { rx: RegExp; hint: string }[] = [
+  { rx: /^layout\/(page|container)\/margin\//, hint: 'margin в layout/ больше нет — рамка страницы это layout/page/padding/*' },
+  { rx: /^layout\/section\//, hint: 'ветка section/ снята — это layout/container/*' },
+  { rx: /^layout\/content\//, hint: 'ветка content/ снята — межблочный интервал это layout/container/gap/*' }
+]
+// Раскладочный токен, оставшийся без корня layout/ (схема 1.10.0, прожила один день)
+export const DS_LAYOUT_ROOTLESS = /^(container|page|section)\/(padding|gap|grid|margin|size|card|typography)\//
+// Служебные коллекции плагина uSpec — не токены продукта, из правил исключены
+const DS_TOOLING_COLLECTIONS = /^specs( layout)?$/
 
 // ruleId → settings key: per-rule visibility toggles in the settings panel
 const DS_RULE_SETTINGS: Record<string, string> = {
@@ -217,6 +350,7 @@ const DS_RULE_SETTINGS: Record<string, string> = {
   'tokens-no-component-tier': 'showRuleComponentTier',
   'gradient-stop-unbound': 'showRuleGradientStops',
   'component-name-pascalcase': 'showRuleComponentName',
+  'subcomponent-name-lowercase': 'showRuleSubComponentName',
   'component-property-camelcase': 'showRulePropCamelCase',
   'boolean-prefix-convention': 'showRuleBooleanPrefix',
   'component-property-tier1-glossary': 'showRuleGlossary',
@@ -227,30 +361,45 @@ const DS_RULE_SETTINGS: Record<string, string> = {
 const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]> => {
   const findings: UnboundProperty[] = []
 
-  const report = (node: SceneNode, path: string, property: string, ruleId: string, message: string) => {
-    findings.push({
+  const report = (node: SceneNode, path: string, property: string, ruleId: string, message: string, fix?: DsFix | null) => {
+    const finding: UnboundProperty = {
       type: 'tokenMisuse',
       property,
       currentValue: safeText(message),
       nodePath: safeText(path),
       nodeId: node.id,
       ruleId
-    })
+    }
+    if (fix) {
+      finding.fixBindVariableId = fix.fixBindVariableId
+      finding.fixBindName = fix.fixBindName
+      finding.fixBindField = fix.fixBindField
+    }
+    findings.push(finding)
   }
 
   // Checks that apply to ANY bound variable regardless of the property
-  const checkUniversal = (node: SceneNode, path: string, propLabel: string, v: ResolvedVar) => {
+  const checkUniversal = async (node: SceneNode, path: string, field: string, propLabel: string, index: number | null, v: ResolvedVar) => {
     const collection = (v.collection || '').toLowerCase()
 
-    // spacing-bind-semantic-layer (hard): device collection is a hidden engine —
-    // bind the semantic layer. Exceptions by design: visible/* booleans, system/device.
-    if (collection === 'device' && !v.name.startsWith('visible/') && v.name !== 'system/device') {
-      report(node, path, propLabel, 'spacing-bind-semantic-layer', `«${v.name}» привязан из коллекции device — биндить semantic-слой (spacing-bind-semantic-layer)`)
-    }
+    // BOOLEAN variables are switch engines (`system/visible/*`, `isloading/skeleton/*`),
+    // not style tokens — by design they live outside the semantic layer. Same for
+    // componentProperties: the DS drives variant tiers by a mode→property bridge.
+    // `Specs`/`Specs Layout` are the uSpec plugin's own collections, not product tokens.
+    if (v.resolvedType === 'BOOLEAN' || field.indexOf('componentProperties.') === 0 ||
+        DS_TOOLING_COLLECTIONS.test(collection) ||
+        /(^|\/)visible\//.test(v.name) || v.name === 'system/device' || v.name === 'device') return
 
-    // Tier discipline: components bind semantic tokens, not primitives directly
-    if (collection.startsWith('primitive') || v.name.startsWith('primitive/')) {
-      report(node, path, propLabel, 'tier-discipline', `«${v.name}» — primitive-токен, биндить semantic-уровень (tier-discipline)`)
+    // Bind the semantic layer, nothing else: primitive is the raw scale,
+    // device and any other collection are hidden engines.
+    const isPrimitive = collection.indexOf('primitive') === 0 || v.name.startsWith('primitive/')
+    if (isPrimitive || (collection && !dsIsSemanticCollection(collection))) {
+      const ruleId = isPrimitive ? 'tier-discipline' : 'spacing-bind-semantic-layer'
+      const head = isPrimitive
+        ? `«${v.name}» — primitive-токен, биндить semantic-уровень`
+        : `«${v.name}» привязан из коллекции «${v.collection}» — биндить semantic-слой`
+      const fix = await dsSuggestSemanticFix(v, field, index)
+      report(node, path, propLabel, ruleId, `${head} (${ruleId})`, fix)
     }
 
     // DEC-024 (tokens-no-disabled-suffix-leaf) RETIRED 2026-07-23: disabled-токены
@@ -281,7 +430,6 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
           const v = await resolveBoundVar(alias.id)
           if (!v) continue
           const label = DS_SPACING_PROP_LABELS[key] || key
-          checkUniversal(node, path, label, v)
 
           const isGapProp = DS_GAP_PROPS.indexOf(key) !== -1
 
@@ -293,37 +441,36 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
             report(node, path, label, 'spacing-category-property-match', `привязан «${v.name}» — на padding-свойства только */padding/* или */margin/* токены (spacing-category-property-match)`)
           }
 
-          // spacing-layout-vocabulary (hard): layout/ names come from the closed vocabulary
-          if (v.name.startsWith('layout/') && !DS_LAYOUT_VOCAB.test(v.name)) {
-            report(node, path, label, 'spacing-layout-vocabulary', `привязан «${v.name}» — вне словаря layout/ (layout/{page/margin|container/padding|content/gap}/{ось}, layout/grid/gutter) (spacing-layout-vocabulary)`)
+          // token-name-variability-namespace (hard): проверяется только на semantic —
+          // внутри device/container те же токены живут с укороченными именами by design
+          // (`layout/page/*`, `layout/gap/*`), это фасадные ветки, а не нарушение схемы
+          if (dsIsSemanticCollection(v.collection)) {
+            const legacy = DS_LAYOUT_LEGACY.filter(l => l.rx.test(v.name))[0]
+            if (legacy) {
+              report(node, path, label, 'spacing-layout-vocabulary', `привязан «${v.name}» — дореформенное имя: ${legacy.hint} (token-name-variability-namespace)`)
+            } else if (v.name.startsWith('layout/') && !DS_LAYOUT_NAMESPACE.test(v.name)) {
+              report(node, path, label, 'spacing-layout-vocabulary', `привязан «${v.name}» — второй сегмент обязан быть источником изменчивости: layout/{container|page|card}/… (token-name-variability-namespace)`)
+            } else if (DS_LAYOUT_ROOTLESS.test(v.name)) {
+              report(node, path, label, 'spacing-layout-vocabulary', `привязан «${v.name}» — раскладочный токен вне корня layout/ (token-name-variability-namespace)`)
+            }
           }
 
-          // spacing-region-scope: page-frame tokens inside components are legal only for
-          // positioning a fullscreen overlay against the viewport — review any other use
+          // spacing-region-scope: layout/page/* зависит от девайса и применяется на
+          // page-шаблоне; внутри компонента легален только для позиционирования
+          // полноэкранного оверлея от вьюпорта — любое другое применение на ревью
           if (v.name.startsWith('layout/page/')) {
             report(node, path, label, 'spacing-region-scope', `привязан «${v.name}» — page-токен внутри компонента; легален только для позиционирования полноэкранного оверлея от вьюпорта, проверить (spacing-region-scope)`)
           }
         }
       }
 
-      // --- Color/other bindings: universal token checks ---
-      for (const arrKey of ['fills', 'strokes']) {
-        const arr = bv[arrKey]
-        if (Array.isArray(arr)) {
-          for (const alias of arr) {
-            if (alias && alias.type === 'VARIABLE_ALIAS') {
-              const v = await resolveBoundVar(alias.id)
-              if (v) checkUniversal(node, path, arrKey === 'fills' ? 'Fill' : 'Stroke Color', v)
-            }
-          }
-        }
-      }
-      for (const key of ['cornerRadius', 'topLeftRadius', 'topRightRadius', 'bottomLeftRadius', 'bottomRightRadius', 'strokeWeight', 'opacity']) {
-        const alias = bv[key]
-        if (alias && alias.type === 'VARIABLE_ALIAS') {
-          const v = await resolveBoundVar(alias.id)
-          if (v) checkUniversal(node, path, key, v)
-        }
+      // --- Every binding on the node: must come from the semantic layer ---
+      for (const b of dsCollectBindings(bv)) {
+        if (isGridLayout && DS_GAP_PROPS.indexOf(b.field) !== -1) continue
+        const v = await resolveBoundVar(b.id)
+        if (!v) continue
+        const label = DS_FIELD_LABELS[b.field] || DS_SPACING_PROP_LABELS[b.field] || b.field
+        await checkUniversal(node, path, b.field, label, b.index, v)
       }
     }
 
@@ -400,6 +547,29 @@ const DS_GLOSSARY_ANTINAMES: Record<string, string> = {
 const DS_STATE_ENUM = ['default', 'hover', 'focus', 'empty', 'filled', 'loading', 'success', 'error', 'disabled']
 const DS_VARIANT_ENUM = ['solid', 'outline', 'ghost', 'unstyled']
 const DS_LABELPOS_ENUM = ['left', 'right']
+// glossary v2, ось priority — семантическая роль, binding к color/action/{priority}/*
+const DS_PRIORITY_ENUM = ['neutral', '1', '2', '3', '4', 'inverse']
+// `size` намеренно не проверяется: enum расширяемый (lg|md|sm, DEC-025)
+
+// Section holding a component's private parts. Live spellings in `Base`:
+// "SubComponent", "_SubComponent", "Subcomponent" (19 sections, 2026-08-13).
+const DS_SUBCOMPONENT_SECTION = /^[._]?sub[\s_-]?components?$/i
+
+// Walks up to the page: is this component parked in a subComponent section?
+export const dsIsInSubComponentSection = (node: BaseNode | null): boolean => {
+  let cur: BaseNode | null = node && node.parent
+  while (cur && cur.type !== 'PAGE' && cur.type !== 'DOCUMENT') {
+    if (cur.type === 'SECTION' && DS_SUBCOMPONENT_SECTION.test((cur.name || '').trim())) return true
+    cur = cur.parent
+  }
+  return false
+}
+
+// Publishing prefixes ('.', '_') sit before the name proper and are not casing
+export const dsSplitHiddenPrefix = (name: string): { prefix: string; body: string } => {
+  const m = /^([._]+)?([\s\S]*)$/.exec(name.trim())
+  return { prefix: (m && m[1]) || '', body: (m && m[2]) || '' }
+}
 
 const dsNamingFinding = (node: BaseNode, property: string, ruleId: string, message: string): UnboundProperty => ({
   type: 'tokenMisuse',
@@ -415,9 +585,20 @@ const dsNamingFinding = (node: BaseNode, property: string, ruleId: string, messa
 const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundProperty[] => {
   const findings: UnboundProperty[] = []
   const name = (root.name || '').trim()
+  const { prefix, body } = dsSplitHiddenPrefix(name)
 
-  // component-name-pascalcase (DEC-032, hard)
-  if (name && !DS_PASCAL.test(name)) {
+  if (dsIsInSubComponentSection(root)) {
+    // subcomponent-name-lowercase: части компонента живут в секции subComponent
+    // и именуются со строчной буквы — так они отличаются от публичных компонентов.
+    // PascalCase-правило здесь не применяется: требования взаимоисключающие.
+    if (body && !/^[a-z]/.test(body)) {
+      const finding = dsNamingFinding(root, 'Имя субкомпонента', 'subcomponent-name-lowercase',
+        `«${name}» лежит в секции subComponent — имя должно начинаться со строчной буквы (subcomponent-name-lowercase)`)
+      finding.fixRename = prefix + dsToCamelCase(body)
+      findings.push(finding)
+    }
+  } else if (name && !DS_PASCAL.test(name)) {
+    // component-name-pascalcase (DEC-032, hard)
     const finding = dsNamingFinding(root, 'Имя компонента', 'component-name-pascalcase',
       `«${name}» — имя компонента должно быть PascalCase слитно, без пробелов/дефисов/подчёркиваний (component-name-pascalcase, DEC-032)`)
     finding.fixRename = dsToPascalCase(name)
@@ -483,6 +664,7 @@ const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundPr
       if (propName === 'state') checkEnum(DS_STATE_ENUM, 'state-axis-canonical-enum', 'DEC-030')
       if (propName === 'variant') checkEnum(DS_VARIANT_ENUM, 'component-property-tier1-glossary', 'DEC-025')
       if (propName === 'labelPosition') checkEnum(DS_LABELPOS_ENUM, 'component-property-tier1-glossary', 'DEC-025')
+      if (propName === 'priority') checkEnum(DS_PRIORITY_ENUM, 'component-property-tier1-glossary', 'DEC-025')
     }
   }
 
@@ -601,18 +783,6 @@ const ChevronRightIcon = ({ color = "#666666", size = 12 }: { color?: string, si
   />
 )
 
-const QuickScanIcon = ({ color = "#69008C", size = 20 }: { color?: string, size?: number }) => (
-  <SVG
-    src={`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M21 6H3"/>
-      <path d="M10 12H3"/>
-      <path d="M10 18H3"/>
-      <circle cx="17" cy="15" r="3"/>
-      <path d="m21 19-1.9-1.9"/>
-    </svg>`}
-  />
-)
-
 const CurrentPageIcon = ({ color = "#1976D2", size = 20 }: { color?: string, size?: number }) => (
   <SVG
     src={`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -622,20 +792,6 @@ const CurrentPageIcon = ({ color = "#1976D2", size = 20 }: { color?: string, siz
       <path d="M20 14a2 2 0 0 1 2 2"/>
       <path d="M20 22a2 2 0 0 0 2-2"/>
       <path d="M16 22a2 2 0 0 1-2-2"/>
-    </svg>`}
-  />
-)
-
-const EntireDocumentIcon = ({ color = "#F57C00", size = 20 }: { color?: string, size?: number }) => (
-  <SVG
-    src={`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M3 7V5a2 2 0 0 1 2-2h2"/>
-      <path d="M17 3h2a2 2 0 0 1 2 2v2"/>
-      <path d="M21 17v2a2 2 0 0 1-2 2h-2"/>
-      <path d="M7 21H5a2 2 0 0 1-2-2v-2"/>
-      <path d="M7 8h8"/>
-      <path d="M7 12h10"/>
-      <path d="M7 16h6"/>
     </svg>`}
   />
 )
@@ -719,6 +875,7 @@ interface SettingsState {
   showRuleComponentTier: boolean
   showRuleGradientStops: boolean
   showRuleComponentName: boolean
+  showRuleSubComponentName: boolean
   showRulePropCamelCase: boolean
   showRuleBooleanPrefix: boolean
   showRuleGlossary: boolean
@@ -754,11 +911,9 @@ interface SettingsState {
 
 function Widget() {
   const [auditData, setAuditData] = useSyncedState<ComponentAuditData[]>('auditData', [])
-  const [quickScanData, setQuickScanData] = useSyncedState<QuickScanData | null>('quickScanData', null)
-  const [isQuickScanning, setIsQuickScanning] = useSyncedState('isQuickScanning', false)
   const [isDeepScanning, setIsDeepScanning] = useSyncedState('isDeepScanning', false)
   const [lastScanTime, setLastScanTime] = useSyncedState('lastScanTime', '')
-  const [currentPageOnly, setCurrentPageOnly] = useSyncedState('currentPageOnly', true)
+  const [lastScanMode, setLastScanMode] = useSyncedState<'page' | 'selection'>('lastScanMode', 'page')
   const [pageProgress, setPageProgress] = useSyncedState<PageProgress[]>('pageProgress', [])
   const [currentProgress, setCurrentProgress] = useSyncedState('currentProgress', '')
   const [expandedPages, setExpandedPages] = useSyncedState<string[]>('expandedPages', [])
@@ -782,6 +937,7 @@ function Widget() {
     showRuleComponentTier: true,
     showRuleGradientStops: true,
     showRuleComponentName: true,
+    showRuleSubComponentName: true,
     showRulePropCamelCase: true,
     showRuleBooleanPrefix: true,
     showRuleGlossary: true,
@@ -851,7 +1007,20 @@ function Widget() {
         figma.notify('❌ Узел или переменная не найдены — пересканируйте')
         return
       }
-      if (prop.fixBindField === 'cornerRadius') {
+      const paintMatch = /^(fills|strokes)\[(\d+)\]$/.exec(prop.fixBindField)
+      if (paintMatch) {
+        // Paints are rebound through the paint object, not setBoundVariable
+        const paintField = paintMatch[1]
+        const paintIndex = Number(paintMatch[2])
+        const paints = node[paintField]
+        if (!Array.isArray(paints) || !paints[paintIndex]) {
+          figma.notify('❌ Заливка изменилась — пересканируйте')
+          return
+        }
+        const next = paints.slice()
+        next[paintIndex] = figma.variables.setBoundVariableForPaint(next[paintIndex], 'color', variable)
+        node[paintField] = next
+      } else if (prop.fixBindField === 'cornerRadius') {
         // Unified radius is not directly bindable — bind all four corners
         for (const f of ['topLeftRadius', 'topRightRadius', 'bottomLeftRadius', 'bottomRightRadius']) {
           node.setBoundVariable(f, variable)
@@ -1423,89 +1592,6 @@ function Widget() {
            component.documentationLinks.some(link => link.uri.trim() !== '')
   }
 
-  const processPageComponentsQuick = (page: PageNode): ComponentAuditData[] => {
-    const components = page.findAll(node => node.type === 'COMPONENT') as ComponentNode[]
-    const safePageName = (page.name || '').trim() || 'Unnamed Page'
-    const currentPageName = (figma.currentPage.name || '').trim() || 'Current Page'
-    
-    const result: ComponentAuditData[] = []
-    const processedComponentSets = new Set<string>()
-    
-    components.forEach(component => {
-      let componentSetName: string | undefined
-      let variantProperties: Record<string, string> | undefined
-      const displayName = (component.name || '').trim() || 'Unnamed Component'
-      let isVariant = false
-
-      if (component.parent && component.parent.type === 'COMPONENT_SET') {
-        const componentSet = component.parent as ComponentSetNode
-        componentSetName = (componentSet.name || '').trim() || undefined
-        isVariant = true
-        
-        // Add component set entry if we haven't processed it yet
-        if (componentSetName && !processedComponentSets.has(componentSet.id)) {
-          processedComponentSets.add(componentSet.id)
-          
-          result.push({
-            id: componentSet.id || 'unknown-component-set',
-            name: componentSetName,
-            pageName: safePageName,
-            hasDescription: hasDescription(componentSet as any),
-            hasDocumentationLink: hasDocumentationLink(componentSet as any),
-            hasUnboundProperties: false, // Skip for quick scan
-            unboundProperties: [], // Skip for quick scan
-            isHiddenFromPublishing: isHiddenFromPublishing(componentSetName),
-            isOnCurrentPage: safePageName === currentPageName,
-            isComponentSet: true
-          })
-        }
-        
-        const variantString = (component.name || '').trim()
-        if (variantString) {
-          const properties: Record<string, string> = {}
-          
-          const pairs = variantString.split(',')
-            .map(pair => pair.trim())
-            .filter(pair => pair.length > 0 && pair.includes('='))
-          
-          pairs.forEach(pair => {
-            const [key, value] = pair.split('=').map(part => part.trim())
-            if (key && key.length > 0 && value && value.length > 0) {
-              properties[key] = value
-            }
-          })
-          
-          if (Object.keys(properties).length > 0) {
-            variantProperties = properties
-          }
-        }
-      }
-
-      // Add individual component/variant entry
-      result.push({
-        id: component.id || 'unknown-component',
-        name: displayName,
-        componentSetName,
-        variantProperties,
-        pageName: safePageName,
-        hasDescription: hasDescription(component),
-        hasDocumentationLink: hasDocumentationLink(component),
-        hasUnboundProperties: false, // Skip for quick scan
-        unboundProperties: [], // Skip for quick scan
-        isHiddenFromPublishing: isHiddenFromPublishing(componentSetName || displayName),
-        isOnCurrentPage: safePageName === currentPageName,
-        isVariant
-      })
-    })
-    
-    // Post-process to determine which component sets should be expandable
-    // For quick scan, we don't have unbound properties data, so component sets are not expandable
-    return result.map(component => ({
-      ...component,
-      hasExpandableContent: component.hasUnboundProperties // Only individual components can be expanded in quick scan
-    }))
-  }
-
   const processPageComponents = async (page: PageNode): Promise<ComponentAuditData[]> => {
     const components = page.findAll(node => node.type === 'COMPONENT') as ComponentNode[]
     const componentSets = page.findAll(node => node.type === 'COMPONENT_SET') as ComponentSetNode[]
@@ -1636,299 +1722,6 @@ function Widget() {
           : (component.hasUnboundProperties || hasDeps)
       }
     })
-  }
-
-  const runQuickScan = async () => {
-    setIsQuickScanning(true)
-    setQuickScanData(null)
-    setSelectionError(null)
-
-    try {
-      setCurrentProgress('Быстрый скан…')
-      
-      await figma.loadAllPagesAsync()
-      const allPages = figma.root.children.filter(child => child.type === 'PAGE') as PageNode[]
-      
-      let allComponents: ComponentAuditData[] = []
-      
-      for (const page of allPages) {
-        const pageComponents = processPageComponentsQuick(page)
-        allComponents = [...allComponents, ...pageComponents]
-      }
-
-      // Calculate quick scan statistics
-      const componentSets = new Set()
-      const regularComponents = new Set()
-      
-      allComponents.forEach(component => {
-        if (component.componentSetName) {
-          componentSets.add(component.componentSetName)
-    } else {
-          regularComponents.add(component.name)
-        }
-      })
-
-      const pagesWithComponents = new Set(allComponents.map(c => c.pageName)).size
-      const uniqueComponents = componentSets.size + regularComponents.size
-      const withoutDescription = allComponents.filter(c => !c.hasDescription).length
-      const withoutDocs = allComponents.filter(c => !c.hasDocumentationLink).length
-      const hiddenComponents = allComponents.filter(c => c.isHiddenFromPublishing).length
-
-      const quickData: QuickScanData = {
-        totalPages: allPages.length,
-        pagesWithComponents,
-        uniqueComponents,
-        totalVariants: allComponents.length,
-        withoutDescription,
-        withoutDocs,
-        totalUnboundProperties: 0, // Will be calculated in deep scan
-        hiddenComponents
-      }
-
-      setQuickScanData(quickData)
-      setLastScanTime(new Date().toUTCString())
-      setCurrentProgress('Быстрый скан завершён!')
-
-    } catch (error) {
-      console.error('Error during quick scan:', error)
-      setCurrentProgress('Ошибка при быстром скане')
-    } finally {
-      setIsQuickScanning(false)
-      setTimeout(() => {
-        setCurrentProgress('')
-      }, 2000)
-    }
-  }
-
-
-
-  const generateSummaryText = (): string => {
-    if (!quickScanData) return ''
-    
-    return `Из ${quickScanData.totalPages} страниц компоненты есть на ${quickScanData.pagesWithComponents}. Найдено ${quickScanData.uniqueComponents} уникальных компонентов и ${quickScanData.totalVariants} вариантов. Без описания — ${quickScanData.withoutDescription}/${quickScanData.totalVariants}, без ссылки на документацию — ${quickScanData.withoutDocs}/${quickScanData.totalVariants}. Скрыто из публикации — ${quickScanData.hiddenComponents}.`
-  }
-
-  const createSummaryFrame = async () => {
-    if (!quickScanData) return
-
-    try {
-      // Create a frame for the summary
-      const frame = figma.createFrame()
-      frame.name = `Сводка аудита компонентов — ${new Date().toLocaleDateString()}`
-      frame.resize(400, 400)
-      
-      // Set frame background to match widget
-      frame.fills = [{
-        type: 'SOLID',
-        color: { r: 1, g: 1, b: 1 }
-      }]
-      
-      // Add stroke to match widget
-      frame.strokes = [{
-        type: 'SOLID',
-        color: { r: 0.93, g: 0.93, b: 0.93 }
-      }]
-      frame.strokeWeight = 1
-      frame.cornerRadius = 16
-      
-      // Add padding
-      frame.paddingTop = 16
-      frame.paddingBottom = 16
-      frame.paddingLeft = 16
-      frame.paddingRight = 16
-      frame.layoutMode = 'VERTICAL'
-      frame.itemSpacing = 16
-      frame.primaryAxisSizingMode = 'AUTO'
-
-      // Title and timestamp in same AutoLayout block
-      const headerFrame = figma.createFrame()
-      headerFrame.name = "Header"
-      headerFrame.layoutMode = 'VERTICAL'
-      headerFrame.itemSpacing = 4
-      headerFrame.primaryAxisSizingMode = 'AUTO'
-      headerFrame.counterAxisSizingMode = 'AUTO'
-      headerFrame.fills = []
-      headerFrame.resize(368, headerFrame.height)
-      frame.appendChild(headerFrame)
-
-      // Title - match widget styling
-      const title = figma.createText()
-      await figma.loadFontAsync({ family: "Inter", style: "Bold" })
-      title.fontName = { family: "Inter", style: "Bold" }
-      title.fontSize = 14
-      title.characters = "🔍 Аудит компонентов"
-      title.fills = [{ type: 'SOLID', color: { r: 0.2, g: 0.2, b: 0.2 } }]
-      title.resize(368, title.height) // Fill container width (400 - 32px padding)
-      headerFrame.appendChild(title)
-
-      // Timestamp
-      const timestamp = figma.createText()
-      await figma.loadFontAsync({ family: "Inter", style: "Regular" })
-      timestamp.fontName = { family: "Inter", style: "Regular" }
-      timestamp.fontSize = 12
-      timestamp.characters = `Сгенерировано ${new Date().toUTCString()}`
-      timestamp.fills = [{ type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }]
-      timestamp.resize(368, timestamp.height) // Fill container width
-      headerFrame.appendChild(timestamp)
-
-      // Summary text
-      const summaryText = figma.createText()
-      summaryText.fontName = { family: "Inter", style: "Regular" }
-      summaryText.fontSize = 12
-      summaryText.lineHeight = { unit: 'PIXELS', value: 18 }
-      summaryText.characters = generateSummaryText()
-      summaryText.fills = [{ type: 'SOLID', color: { r: 0.133, g: 0.133, b: 0.133 } }]
-      summaryText.textAutoResize = 'WIDTH_AND_HEIGHT'
-      summaryText.resize(368, summaryText.height) // Fill container width
-      frame.appendChild(summaryText)
-
-      // Statistics breakdown
-      const statsFrame = figma.createFrame()
-      statsFrame.name = "Statistics"
-      statsFrame.layoutMode = 'VERTICAL'
-      statsFrame.itemSpacing = 12
-      statsFrame.primaryAxisSizingMode = 'AUTO'
-      statsFrame.counterAxisSizingMode = 'AUTO'
-      statsFrame.fills = [{
-        type: 'SOLID',
-        color: { r: 0.98, g: 0.95, b: 1 }
-      }]
-      statsFrame.cornerRadius = 8
-      statsFrame.paddingTop = 12
-      statsFrame.paddingBottom = 12
-      statsFrame.paddingLeft = 12
-      statsFrame.paddingRight = 12
-      statsFrame.resize(368, statsFrame.height) // Fill container width
-
-      const statsTitle = figma.createText()
-      statsTitle.fontName = { family: "Inter", style: "Bold" }
-      statsTitle.fontSize = 14
-      statsTitle.characters = "📊 Подробная разбивка"
-      statsTitle.fills = [{ type: 'SOLID', color: { r: 0.55, g: 0, b: 0.55 } }]
-      statsFrame.appendChild(statsTitle)
-
-      // Create individual stat items
-      const stats = [
-        { label: "Всего страниц", value: quickScanData.totalPages.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Страниц с компонентами", value: quickScanData.pagesWithComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Уникальных компонентов", value: quickScanData.uniqueComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Всего вариантов", value: quickScanData.totalVariants.toString(), color: { r: 0.55, g: 0, b: 0.55 } },
-        { label: "Без описания", value: `${quickScanData.withoutDescription}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
-        { label: "Без ссылки на документацию", value: `${quickScanData.withoutDocs}/${quickScanData.totalVariants}`, color: { r: 0.96, g: 0.26, b: 0.21 } },
-        { label: "Скрыто из публикации", value: quickScanData.hiddenComponents.toString(), color: { r: 0.55, g: 0, b: 0.55 } }
-      ]
-
-      for (const stat of stats) {
-        const statRow = figma.createFrame()
-        statRow.layoutMode = 'HORIZONTAL'
-        statRow.itemSpacing = 8
-        statRow.primaryAxisSizingMode = 'AUTO'
-        statRow.counterAxisSizingMode = 'AUTO'
-        statRow.fills = []
-
-        const statLabel = figma.createText()
-        statLabel.fontName = { family: "Inter", style: "Regular" }
-        statLabel.fontSize = 12
-        statLabel.characters = stat.label + ":"
-        statLabel.fills = [{ type: 'SOLID', color: { r: 0.55, g: 0, b: 0.55 } }]
-        statLabel.resize(200, statLabel.height)
-        statRow.appendChild(statLabel)
-
-        const statValue = figma.createText()
-        statValue.fontName = { family: "Inter", style: "Bold" }
-        statValue.fontSize = 12
-        statValue.characters = stat.value
-        statValue.fills = [{ type: 'SOLID', color: stat.color }]
-        statRow.appendChild(statValue)
-
-        statsFrame.appendChild(statRow)
-      }
-
-      frame.appendChild(statsFrame)
-
-      // JSON Data section
-      const jsonContent = JSON.stringify({
-        ...quickScanData,
-        exportedAt: new Date().toISOString(),
-        documentName: figma.root.name
-      }, null, 2)
-
-      const jsonSectionFrame = figma.createFrame()
-      jsonSectionFrame.name = "JSON Data"
-      jsonSectionFrame.layoutMode = 'VERTICAL'
-      jsonSectionFrame.itemSpacing = 8
-      jsonSectionFrame.primaryAxisSizingMode = 'AUTO'
-      jsonSectionFrame.counterAxisSizingMode = 'AUTO'
-      jsonSectionFrame.fills = [{
-        type: 'SOLID',
-        color: { r: 0.97, g: 0.97, b: 0.97 }
-      }]
-      jsonSectionFrame.strokes = [{ 
-        type: 'SOLID',
-        color: { r: 0.929, g: 0.929, b: 0.929 }
-      }]
-      jsonSectionFrame.strokeWeight = 1
-      jsonSectionFrame.cornerRadius = 8
-      jsonSectionFrame.paddingTop = 12
-      jsonSectionFrame.paddingBottom = 12
-      jsonSectionFrame.paddingLeft = 12
-      jsonSectionFrame.paddingRight = 12
-      jsonSectionFrame.resize(368, jsonSectionFrame.height)
-
-      const jsonTitle = figma.createText()
-      jsonTitle.fontName = { family: "Inter", style: "Bold" }
-      jsonTitle.fontSize = 10
-      jsonTitle.characters = "📋 JSON-экспорт — для версионирования"
-      jsonTitle.fills = [{ type: 'SOLID', color: { r: 0, g: 0, b: 0 } }]
-      jsonSectionFrame.appendChild(jsonTitle)
-
-      const jsonText = figma.createText()
-      jsonText.fontName = { family: "Inter", style: "Regular" }
-      jsonText.fontSize = 10
-      jsonText.lineHeight = { unit: 'PIXELS', value: 14 }
-      jsonText.characters = jsonContent
-      jsonText.fills = [{ type: 'SOLID', color: { r: 0.133, g: 0.133, b: 0.133 } }]
-      jsonText.textAutoResize = 'WIDTH_AND_HEIGHT'
-      jsonText.resize(344, jsonText.height)
-      jsonSectionFrame.appendChild(jsonText)
-
-      const jsonInstruction = figma.createText()
-      jsonInstruction.fontName = { family: "Inter", style: "Regular" }
-      jsonInstruction.fontSize = 10
-      jsonInstruction.characters = "💡 Select and copy this JSON data to save as a .json file"
-      jsonInstruction.fills = [{ type: 'SOLID', color: { r: 0.5, g: 0.5, b: 0.5 } }]
-      jsonInstruction.resize(344, jsonInstruction.height)
-      jsonSectionFrame.appendChild(jsonInstruction)
-
-      frame.appendChild(jsonSectionFrame)
-
-      // Position the frame 120px to the right of the widget at the same Y level
-      // Get the widget's position using async getNodeById
-      try {
-        const widgetNode = await figma.getNodeByIdAsync(figma.widgetId!)
-        if (widgetNode && 'x' in widgetNode && 'y' in widgetNode && 'width' in widgetNode) {
-          frame.x = widgetNode.x + widgetNode.width + 120
-          frame.y = widgetNode.y
-        } else {
-          // Fallback to viewport center if widget not found
-          frame.x = figma.viewport.center.x + 400
-          frame.y = figma.viewport.center.y
-        }
-      } catch (err) {
-        // Fallback to viewport center on error
-        frame.x = figma.viewport.center.x + 400
-        frame.y = figma.viewport.center.y
-      }
-
-      // Select the frame so user can see it
-      figma.currentPage.selection = [frame]
-      figma.viewport.scrollAndZoomIntoView([frame])
-
-      figma.notify('✅ Сводка добавлена на канвас!')
-
-    } catch (error) {
-      console.error('Error creating summary frame:', error)
-    }
   }
 
   const toggleComponentExpansion = (componentId: string) => {
@@ -2147,10 +1940,7 @@ function Widget() {
 
 const navigateToComponent = async (componentId: string, specificNodeId?: string) => {
   try {
-    if (!currentPageOnly) {
-      await figma.loadAllPagesAsync()
-    }
-    
+    // Both scan modes stay on the current page — no cross-page loading needed
     // If we have a specific node ID, try to navigate to that node instead
     const targetNodeId = specificNodeId || componentId
     const targetNode = await figma.getNodeByIdAsync(targetNodeId)
@@ -2174,12 +1964,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
   }
 }
 
-  const toggleScanScope = () => {
-    setCurrentPageOnly(!currentPageOnly)
-  }
-
   const resetAll = () => {
-    setQuickScanData(null)
     setAuditData([])
     setLastScanTime('')
     setPageProgress([])
@@ -2203,6 +1988,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       showRuleComponentTier: true,
       showRuleGradientStops: true,
       showRuleComponentName: true,
+    showRuleSubComponentName: true,
       showRulePropCamelCase: true,
       showRuleBooleanPrefix: true,
       showRuleGlossary: true,
@@ -2238,16 +2024,11 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
   }
 
   const rescan = async () => {
-    if (quickScanData && auditData.length === 0) {
-      // If we only have quick scan data, re-run quick scan
-      await runQuickScan()
-    } else if (auditData.length > 0) {
-      // If we have deep scan data, re-run the same scope
-      if (currentPageOnly) {
-        await runDeepScanCurrentPage()
-      } else {
-        await runDeepScanAllPages()
-      }
+    if (auditData.length === 0) return
+    if (lastScanMode === 'selection') {
+      await runScanSelection()
+    } else {
+      await runDeepScanCurrentPage()
     }
   }
 
@@ -2313,69 +2094,6 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
       console.error('Error in cleanComponentData:', error)
       return []
     }
-  }
-
-  const QuickScanResults = () => {
-    if (!quickScanData) return null
-
-    return (
-      <AutoLayout direction="vertical" spacing={12} padding={12} fill="#FAECFF" cornerRadius={16} width="fill-parent">
-        {/* <Text fontSize={12} fontWeight={700}>Quick Scan Results</Text> */}
-        <AutoLayout direction="horizontal" spacing={4} width="fill-parent" wrap={true}>
-          <Text fontSize={16} fill="#8C00BA">Из</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalPages)}</Text>
-          <Text fontSize={16} fill="#8C00BA">страниц</Text>
-          <Text fontSize={16} fill="#8C00BA">компоненты</Text>
-          <Text fontSize={16} fill="#8C00BA">есть</Text>
-          <Text fontSize={16} fill="#8C00BA">на</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}.</Text>
-          <Text fontSize={16} fill="#8C00BA">Найдено</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.uniqueComponents)}</Text>
-          <Text fontSize={16} fill="#8C00BA">уникальных</Text>
-          <Text fontSize={16} fill="#8C00BA">компонентов</Text>
-          <Text fontSize={16} fill="#8C00BA">и</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalVariants)}</Text>
-          <Text fontSize={16} fill="#8C00BA">вариантов.</Text>
-
-          <Text fontSize={16} fill="#8C00BA">Без</Text>
-          <Text fontSize={16} fill="#8C00BA">описания</Text>
-          <Text fontSize={16} fill="#8C00BA">—</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)},</Text>
-          <Text fontSize={16} fill="#8C00BA">без</Text>
-          <Text fontSize={16} fill="#8C00BA">ссылки</Text>
-          <Text fontSize={16} fill="#8C00BA">на</Text>
-          <Text fontSize={16} fill="#8C00BA">документацию</Text>
-          <Text fontSize={16} fill="#8C00BA">—</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}.</Text>
-
-          <Text fontSize={16} fill="#8C00BA">Скрыто</Text>
-          <Text fontSize={16} fill="#8C00BA">из</Text>
-          <Text fontSize={16} fill="#8C00BA">публикации</Text>
-          <Text fontSize={16} fill="#8C00BA">—</Text>
-          <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}.</Text>
-        </AutoLayout>
-
-        <AutoLayout direction="horizontal" spacing={8} verticalAlignItems="center">
-          <AutoLayout 
-            fill="#EFBEFF"
-            cornerRadius={8} 
-            padding={{ vertical: 6, horizontal: 10 }} 
-            stroke="#E498FF"
-            strokeWidth={1}
-            onClick={createSummaryFrame}
-            hoverStyle={{ fill: "#FCF5FF", stroke: "#8C00BA" }}
-          >
-            <Text fontSize={12} fill="#69008C" fontWeight={600}>Сводку на канвас</Text>
-          </AutoLayout>
-
-          {lastScanTime && (
-            <Text fontSize={11} fill="#8C00BA">
-              {`Скан: ${safeText(lastScanTime)}`}
-            </Text>
-          )}
-        </AutoLayout>
-      </AutoLayout>
-    )
   }
 
   const ProgressIndicator = () => {
@@ -2517,7 +2235,11 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                         <Text fontSize={11} fill="#6A0000" width="fill-parent">{safeCurrentValue}</Text>
                       </AutoLayout>
                       {prop.fixBindName && (
-                        <Text fontSize={10} fill="#7A3E00" width="fill-parent">{`→ есть токен с этим значением: ${prop.fixBindName}`}</Text>
+                        <Text fontSize={10} fill="#7A3E00" width="fill-parent">
+                          {prop.type === 'tokenMisuse'
+                            ? `→ семантическая замена с тем же значением: ${prop.fixBindName}`
+                            : `→ есть токен с этим значением: ${prop.fixBindName}`}
+                        </Text>
                       )}
                     </AutoLayout>
                     {prop.fixBindName && (
@@ -2930,6 +2652,7 @@ const SettingsPanel = ({
             {/* DS naming rules group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
               <SimpleCheckbox checked={settings.showRuleComponentName !== false} label="Имя компонента" onClick={() => toggleSetting('showRuleComponentName')} isFirst={true} />
+              <SimpleCheckbox checked={settings.showRuleSubComponentName !== false} label="Имя субкомпонента" onClick={() => toggleSetting('showRuleSubComponentName')} />
               <SimpleCheckbox checked={settings.showRulePropCamelCase !== false} label="camelCase свойств" onClick={() => toggleSetting('showRulePropCamelCase')} />
               <SimpleCheckbox checked={settings.showRuleBooleanPrefix !== false} label="is*/has*" onClick={() => toggleSetting('showRuleBooleanPrefix')} />
               <SimpleCheckbox checked={settings.showRuleGlossary !== false} label="Глоссарий осей" onClick={() => toggleSetting('showRuleGlossary')} />
@@ -3374,7 +3097,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     )
   }
 
-  const runDeepScanWithScope = async (scanCurrentPageOnly: boolean) => {
+  const runDeepScanCurrentPage = async () => {
     setIsDeepScanning(true)
     setAuditData([])
     setPageProgress([])
@@ -3382,106 +3105,41 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     setExpandedComponents([])
     setPageDisplayCounts({})
     setSelectionError(null)
-    
+    setLastScanMode('page')
+
     try {
-      if (scanCurrentPageOnly) {
-        setCurrentProgress('Глубокий скан текущей страницы…')
-        const currentPage = figma.currentPage
-        const safeCurrentPageName = (currentPage.name || '').trim() || 'Current Page'
-        
-        setPageProgress([{
-          name: safeCurrentPageName,
-          status: 'loading',
-          componentCount: 0
-        }])
+      setCurrentProgress('Глубокий скан текущей страницы…')
+      const currentPage = figma.currentPage
+      const safeCurrentPageName = (currentPage.name || '').trim() || 'Current Page'
 
-        buildSlugRegistry([currentPage])
-        await buildFloatTokenMap()
-        const pageComponents = await processPageComponents(currentPage)
+      setPageProgress([{
+        name: safeCurrentPageName,
+        status: 'loading',
+        componentCount: 0
+      }])
 
-        setPageProgress([{
-          name: safeCurrentPageName,
-          status: 'complete',
-          componentCount: pageComponents.length
-        }])
+      buildSlugRegistry([currentPage])
+      await buildTokenMaps()
+      const pageComponents = await processPageComponents(currentPage)
 
-        // Clean and serialize the data before storing
-        try {
-          const cleanedComponents = cleanComponentData(pageComponents)
-          setAuditData(cleanedComponents)
-        } catch (dataError) {
-          console.error(`Error setting audit data for current page:`, dataError)
-          setAuditData([]) // Fallback to empty array
-        }
-        
-        setExpandedPages([safeCurrentPageName])
-        setPageDisplayCounts({ [safeCurrentPageName]: CHUNK_SIZE })
-        setCurrentProgress(`Глубокий скан завершён: найдено ${pageComponents.length} комп.`)
-        
-      } else {
-        setCurrentProgress('Глубокий скан всех страниц…')
-        
-        await figma.loadAllPagesAsync()
-        const allPages = figma.root.children.filter(child => child.type === 'PAGE') as PageNode[]
-        
-        const initialProgress: PageProgress[] = allPages.map((page, index) => ({
-          name: (page.name || '').trim() || `Page ${index + 1}`,
-          status: 'pending' as const,
-          componentCount: 0
-        }))
-        setPageProgress(initialProgress)
-        buildSlugRegistry(allPages)
-        await buildFloatTokenMap()
+      setPageProgress([{
+        name: safeCurrentPageName,
+        status: 'complete',
+        componentCount: pageComponents.length
+      }])
 
-        let allComponents: ComponentAuditData[] = []
-        
-        for (let i = 0; i < allPages.length; i++) {
-          const page = allPages[i]
-          const safePage = {
-            ...page,
-            name: (page.name || '').trim() || `Page ${i + 1}`
-          }
-          
-          try {
-            setCurrentProgress(`Скан страницы ${i + 1}/${allPages.length}: ${safePage.name}`)
-            setPageProgress(prev => prev.map(p => 
-              p.name === safePage.name 
-                ? { ...p, status: 'loading' }
-                : p
-            ))
-
-            const pageComponents = await processPageComponents(page)
-            allComponents = [...allComponents, ...pageComponents]
-            
-            setPageProgress(prev => prev.map(p => 
-              p.name === safePage.name 
-                ? { ...p, status: 'complete', componentCount: pageComponents.length }
-                : p
-            ))
-
-            // Clean and serialize the data before storing
-            try {
-              const cleanedComponents = cleanComponentData(allComponents)
-              setAuditData(cleanedComponents)
-            } catch (dataError) {
-              console.error(`Error setting audit data for page ${safePage.name}:`, dataError)
-              // Continue without updating audit data for this page
-            }
-            
-            await new Promise(resolve => setTimeout(resolve, 200))
-            
-          } catch (error) {
-            console.error(`Error processing page ${safePage.name}:`, error)
-            setPageProgress(prev => prev.map(p => 
-              p.name === safePage.name 
-                ? { ...p, status: 'error', componentCount: 0 }
-                : p
-            ))
-          }
-        }
-
-        setCurrentProgress(`Глубокий скан завершён! Найдено ${allComponents.length} комп. на ${allPages.length} страницах`)
+      // Clean and serialize the data before storing
+      try {
+        const cleanedComponents = cleanComponentData(pageComponents)
+        setAuditData(cleanedComponents)
+      } catch (dataError) {
+        console.error(`Error setting audit data for current page:`, dataError)
+        setAuditData([]) // Fallback to empty array
       }
+
+      setExpandedPages([safeCurrentPageName])
+      setPageDisplayCounts({ [safeCurrentPageName]: CHUNK_SIZE })
+      setCurrentProgress(`Глубокий скан завершён: найдено ${pageComponents.length} комп.`)
 
       setLastScanTime(new Date().toUTCString())
       
@@ -3500,11 +3158,6 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         setPageProgress([])
       }, 3000)
     }
-  }
-
-  const runDeepScanCurrentPage = async () => {
-    setCurrentPageOnly(true)
-    await runDeepScanWithScope(true)
   }
 
   const runScanSelection = async () => {
@@ -3540,7 +3193,8 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     
     // Clear any previous error
     setSelectionError(null)
-    
+    setLastScanMode('selection')
+
     setIsDeepScanning(true)
     setAuditData([])
     setPageProgress([])
@@ -3560,7 +3214,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       const result: ComponentAuditData[] = []
 
       buildSlugRegistry([currentPage])
-      await buildFloatTokenMap()
+      await buildTokenMaps()
 
       // Process each selected component
       for (const component of selectedComponents) {
@@ -3654,27 +3308,6 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
     }
   }
 
-  const runDeepScanAllPages = async () => {
-    try {
-      // Step 1: Run quick scan first to ensure proper initialization
-      setCurrentProgress('Инициализация: быстрый скан…')
-      await runQuickScan()
-      
-      // Wait a moment for quick scan to complete
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      
-      // Step 2: Now run the deep scan
-      setCurrentProgress('Старт глубокого скана всех страниц…')
-      setCurrentPageOnly(false)
-      await runDeepScanWithScope(false)
-    } catch (error) {
-      console.error('Error in deep scan all pages:', error)
-      setCurrentProgress('Error occurred during scan')
-      setIsDeepScanning(false)
-    }
-  }
-
-
   return (
     <AutoLayout direction="vertical" spacing={16} padding={16} fill="#FFFFFF" cornerRadius={16} stroke="#eee" width={560} height="hug-contents">
       <AutoLayout direction="horizontal" spacing={12} width="fill-parent">
@@ -3683,14 +3316,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             <Text fontSize={12} fontWeight={700}>🔍</Text>
             <Text fontSize={16} fontWeight={700}>Аудит компонентов</Text>
           </AutoLayout>
-          {!isQuickScanning && !isDeepScanning && auditData.length === 0 && (
+          {!isDeepScanning && auditData.length === 0 && (
             <Text fontSize={12} fill="#333" horizontalAlignText="center">
               Выберите тип сканирования для анализа компонентов.
             </Text>
           )}
       </AutoLayout>
-  
-        {(quickScanData || auditData.length > 0) && (
+
+        {auditData.length > 0 && (
           <AutoLayout direction="horizontal" spacing={8}>
             <AutoLayout 
               fill="#1976D2"
@@ -3716,97 +3349,11 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         )}
       </AutoLayout>
 
-    {/* Scan Options - Show all three when no scan is active or completed */}
-    {!isQuickScanning && !isDeepScanning && auditData.length === 0 && (
+    {/* Scan Options — shown while no scan is active or completed */}
+    {!isDeepScanning && auditData.length === 0 && (
       <AutoLayout direction="vertical" spacing={12} width="fill-parent">
         <AutoLayout direction="vertical" spacing={8} width="fill-parent">
           
-          {/* Quick Scan Option */}
-          <AutoLayout direction="vertical" spacing={8} padding={12} fill="#FAECFF" stroke="#ECCBF8" strokeWidth={1} cornerRadius={16} width="fill-parent">
-            <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
-              <QuickScanIcon color="#8C00BA" size={16} />
-              <Text fontSize={12} fontWeight={600} fill="#8C00BA">Быстрый скан</Text>
-            </AutoLayout>
-            
-            {!quickScanData ? (
-              <>
-                <AutoLayout direction="vertical" spacing={4} width="fill-parent">
-                  <Text fontSize={11} fill="#8C00BA" width="fill-parent">
-                    Быстрый обзор всех компонентов документа: количество, отсутствующие описания и ссылки на документацию.
-                  </Text>
-                </AutoLayout>
-                <AutoLayout 
-                  fill="#F3D0FF"
-                  cornerRadius={8} 
-                  padding={{ vertical: 6, horizontal: 10 }} 
-                  stroke="#CB3BFE"
-                  strokeWidth={1}
-                  onClick={runQuickScan}
-                  hoverStyle={{ fill: "#F6DFFE" }}
-                  width="hug-contents"
-                >
-                  <Text fontSize={12} fill="#6D138B" fontWeight={600}>Запустить быстрый скан</Text>
-                </AutoLayout>
-              </>
-            ) : (
-              <AutoLayout direction="vertical" spacing={8} width="fill-parent">
-                <AutoLayout direction="horizontal" spacing={4} width="fill-parent" wrap={true}>
-                  <Text fontSize={16} fill="#8C00BA">Из</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalPages)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">страниц</Text>
-                  <Text fontSize={16} fill="#8C00BA">компоненты</Text>
-                  <Text fontSize={16} fill="#8C00BA">есть</Text>
-                  <Text fontSize={16} fill="#8C00BA">на</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.pagesWithComponents)}.</Text>
-                  <Text fontSize={16} fill="#8C00BA">Найдено</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.uniqueComponents)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">уникальных</Text>
-                  <Text fontSize={16} fill="#8C00BA">компонентов</Text>
-                  <Text fontSize={16} fill="#8C00BA">и</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.totalVariants)}</Text>
-                  <Text fontSize={16} fill="#8C00BA">вариантов.</Text>
-
-                  <Text fontSize={16} fill="#8C00BA">Без</Text>
-                  <Text fontSize={16} fill="#8C00BA">описания</Text>
-                  <Text fontSize={16} fill="#8C00BA">—</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDescription)}/{safeText(quickScanData.totalVariants)},</Text>
-                  <Text fontSize={16} fill="#8C00BA">без</Text>
-                  <Text fontSize={16} fill="#8C00BA">ссылки</Text>
-                  <Text fontSize={16} fill="#8C00BA">на</Text>
-                  <Text fontSize={16} fill="#8C00BA">документацию</Text>
-                  <Text fontSize={16} fill="#8C00BA">—</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.withoutDocs)}/{safeText(quickScanData.totalVariants)}.</Text>
-
-                  <Text fontSize={16} fill="#8C00BA">Скрыто</Text>
-                  <Text fontSize={16} fill="#8C00BA">из</Text>
-                  <Text fontSize={16} fill="#8C00BA">публикации</Text>
-                  <Text fontSize={16} fill="#8C00BA">—</Text>
-                  <Text fontSize={16} fontWeight={700} fill="#8C00BA">{safeText(quickScanData.hiddenComponents)}.</Text>
-                </AutoLayout>
-
-                <AutoLayout direction="vertical" spacing={8} width="fill-parent">
-                  <AutoLayout 
-                    fill="#EFBEFF"
-                    cornerRadius={8} 
-                    padding={{ vertical: 6, horizontal: 10 }} 
-                    stroke="#E498FF"
-                    strokeWidth={1}
-                    onClick={createSummaryFrame}
-                    hoverStyle={{ fill: "#FCF5FF", stroke: "#8C00BA" }}
-                  >
-                    <Text fontSize={12} fill="#69008C" fontWeight={600}>Сводку на канвас</Text>
-                  </AutoLayout>
-
-                  {lastScanTime && (
-                    <Text fontSize={11} fill="#8C00BA">
-                      {`Скан: ${safeText(lastScanTime)}`}
-                    </Text>
-                  )}
-                </AutoLayout>
-              </AutoLayout>
-            )}
-          </AutoLayout>
-
           {/* Selection Scan Option */}
           <AutoLayout direction="vertical" spacing={8} padding={12} fill="#ECFEED" stroke="#CDEED0" strokeWidth={1} cornerRadius={16} width="fill-parent">
             <AutoLayout direction="vertical" spacing={4} width="fill-parent">
@@ -3864,40 +3411,9 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             </AutoLayout>
           </AutoLayout>
 
-          {/* All Pages Deep Scan Option */}
-          <AutoLayout direction="vertical" spacing={8} padding={12} fill="#FFF6DB" stroke="#F9E5A7" strokeWidth={1} cornerRadius={16} width="fill-parent">
-            <AutoLayout direction="vertical" spacing={4} width="fill-parent">
-              <AutoLayout direction="horizontal" spacing={4} verticalAlignItems="center">
-                <EntireDocumentIcon color="#856404" size={16} />
-                <Text fontSize={12} fontWeight={600} fill="#856404">Весь файл</Text>
-              </AutoLayout>
-              <Text fontSize={11} fill="#856404" width="fill-parent">
-                Полный анализ всех компонентов на всех страницах. Может быть медленным; на больших файлах Figma может упасть.
-              </Text>
-            </AutoLayout>
-            <AutoLayout 
-              fill="#FFEFB8"
-              cornerRadius={8} 
-              padding={{ vertical: 6, horizontal: 10 }} 
-              stroke="#AA8000"
-              strokeWidth={1}
-              onClick={runDeepScanAllPages}
-              hoverStyle={{ fill: "#FEF4D2" }}
-              width="hug-contents"
-            >
-              <Text fontSize={12} fill="#5F4301" fontWeight={600}>Сканировать весь файл</Text>
-            </AutoLayout>
-          </AutoLayout>
         </AutoLayout>
       </AutoLayout>
     )}
-
-      {/* Progress for quick scan */}
-      {isQuickScanning && currentProgress && currentProgress.trim() && (
-        <AutoLayout direction="vertical" spacing={8} padding={12} fill="#F0F8FF" cornerRadius={16} width="fill-parent">
-          <Text fontSize={12} fontWeight={600}>{currentProgress.trim()}</Text>
-        </AutoLayout>
-      )}
 
       {/* Deep Scan Results */}
       {auditData.length > 0 && (
@@ -3909,7 +3425,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
             <AutoLayout width="fill-parent">
               {lastScanTime && (
                 <Text fontSize={11} fill="#333333">
-                  {`Скан: ${safeText(lastScanTime)} (${currentPageOnly ? 'текущая страница' : 'все страницы'})`}
+                  {`Скан: ${safeText(lastScanTime)} (${lastScanMode === 'selection' ? 'выделение' : 'текущая страница'})`}
         </Text>
       )}
             </AutoLayout>
