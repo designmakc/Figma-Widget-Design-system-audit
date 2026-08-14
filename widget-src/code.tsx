@@ -1959,16 +1959,27 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
 
       // Show notification with node name and return instruction
       const nodeName = specificNodeId ? targetNode.name : safeText(targetNode.name)
-      figma.notify(`${safeText(nodeName)} • двойной клик по слою виджета — тоже возврат`, {
-        timeout: 300000,
-        button: {
-          text: '← К виджету',
-          action: () => {
-            figma.viewport.center = prevCenter
-            figma.viewport.zoom = prevZoom
-            figma.currentPage.selection = prevSelection
-          }
-        }
+
+      // Тост с action-кнопкой закрывается, как только код виджета доработал, а сами
+      // тосты встают в очередь, а не заменяют друг друга — поэтому со второго перехода
+      // кнопка возврата не появлялась. Держим обработчик живым, пока тост на экране:
+      // промис резолвится по нажатию кнопки или по закрытию тоста (таймаут / дисмисс).
+      await new Promise<void>(resolve => {
+        let done = false
+        const finish = () => { if (!done) { done = true; resolve() } }
+        figma.notify(`${safeText(nodeName)} • двойной клик по слою виджета — тоже возврат`, {
+          timeout: 60000,
+          button: {
+            text: '← К виджету',
+            action: () => {
+              figma.viewport.center = prevCenter
+              figma.viewport.zoom = prevZoom
+              figma.currentPage.selection = prevSelection
+              finish()
+            }
+          },
+          onDequeue: finish
+        })
       })
     }
   } catch (error) {
