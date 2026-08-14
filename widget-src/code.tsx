@@ -86,26 +86,62 @@ interface ResolvedVar {
 export const dsIsSemanticCollection = (collection: string): boolean =>
   (collection || '').toLowerCase().indexOf('semantic') === 0
 
-// Variable ids repeat heavily across components — resolve each id once per session.
+// Variable ids repeat heavily across components — resolve each id once per scan.
+// Коллекций единицы на тысячи привязок, объекты переменных переиспользуются
+// резолвом алиасов и подсказками — без этих кэшей один и тот же id ходил
+// в Figma по нескольку раз на каждую находку.
 const dsVarCache = new Map<string, ResolvedVar | null>()
+const dsVarObjCache = new Map<string, any>()
+const dsCollCache = new Map<string, any>()
+const dsFixCache = new Map<string, DsFix | null>()
+
+const dsGetVariable = async (id: string): Promise<any> => {
+  if (dsVarObjCache.has(id)) return dsVarObjCache.get(id)
+  let v: any = null
+  try { v = await figma.variables.getVariableByIdAsync(id) } catch (e) { /* unresolvable id */ }
+  dsVarObjCache.set(id, v)
+  return v
+}
+
+const dsGetCollection = async (id: string): Promise<any> => {
+  if (dsCollCache.has(id)) return dsCollCache.get(id)
+  let c: any = null
+  try { c = await figma.variables.getVariableCollectionByIdAsync(id) } catch (e) { /* remote collection */ }
+  dsCollCache.set(id, c)
+  return c
+}
+
+// Кэши переживают скан, а Figma между сканами меняется — сбрасываем на старте каждого
+const dsResetCaches = () => {
+  dsVarCache.clear()
+  dsVarObjCache.clear()
+  dsCollCache.clear()
+  dsFixCache.clear()
+}
+
+// Тайминги фаз скана: без них «медленно» не отличить от «медленно вот здесь».
+// Сводка уходит в консоль плагина по завершении скана.
+const dsTiming = { tokenMaps: 0, unbound: 0, misuse: 0, naming: 0, deps: 0, components: 0 }
+const dsResetTiming = () => {
+  dsTiming.tokenMaps = 0; dsTiming.unbound = 0; dsTiming.misuse = 0
+  dsTiming.naming = 0; dsTiming.deps = 0; dsTiming.components = 0
+}
+const dsLogTiming = (total: number) => {
+  const ms = (n: number) => `${Math.round(n)}ms`
+  console.log(
+    `[DS Audit] скан ${ms(total)} на ${dsTiming.components} комп. — ` +
+    `токен-карты ${ms(dsTiming.tokenMaps)}, unbound ${ms(dsTiming.unbound)}, ` +
+    `правила ДС ${ms(dsTiming.misuse)}, имена ${ms(dsTiming.naming)}, зависимости ${ms(dsTiming.deps)}`
+  )
+}
 
 const resolveBoundVar = async (id: string): Promise<ResolvedVar | null> => {
   if (dsVarCache.has(id)) return dsVarCache.get(id) || null
   let resolved: ResolvedVar | null = null
-  try {
-    const v = await figma.variables.getVariableByIdAsync(id)
-    if (v) {
-      let collection = ''
-      try {
-        const c = await figma.variables.getVariableCollectionByIdAsync(v.variableCollectionId)
-        if (c) collection = c.name
-      } catch (e) {
-        // Remote (library) collections may not resolve — variable name alone still usable
-      }
-      resolved = { id, name: v.name, collection, resolvedType: String(v.resolvedType || '') }
-    }
-  } catch (e) {
-    // Unresolvable id — treat as unknown, never crash the scan
+  const v = await dsGetVariable(id)
+  if (v) {
+    const c = await dsGetCollection(v.variableCollectionId)
+    resolved = { id, name: v.name, collection: c ? c.name : '', resolvedType: String(v.resolvedType || '') }
   }
   dsVarCache.set(id, resolved)
   return resolved
@@ -139,37 +175,25 @@ let dsColorTokens: DsColorToken[] = []
 
 const dsResolveFloatValue = async (varObj: any, depth: number): Promise<number | null> => {
   if (!varObj || depth > 4) return null
-  let col: any = null
-  try {
-    col = await figma.variables.getVariableCollectionByIdAsync(varObj.variableCollectionId)
-  } catch (e) { /* remote collection */ }
+  const col = await dsGetCollection(varObj.variableCollectionId)
   if (!col) return null
   const modeId = col.defaultModeId || (col.modes && col.modes[0] && col.modes[0].modeId)
   const raw = varObj.valuesByMode ? varObj.valuesByMode[modeId] : undefined
   if (typeof raw === 'number') return raw
   if (raw && typeof raw === 'object' && (raw as any).type === 'VARIABLE_ALIAS') {
-    try {
-      const next = await figma.variables.getVariableByIdAsync((raw as any).id)
-      return dsResolveFloatValue(next, depth + 1)
-    } catch (e) { return null }
+    return dsResolveFloatValue(await dsGetVariable((raw as any).id), depth + 1)
   }
   return null
 }
 
 const dsResolveColorValue = async (varObj: any, depth: number): Promise<any> => {
   if (!varObj || depth > 4) return null
-  let col: any = null
-  try {
-    col = await figma.variables.getVariableCollectionByIdAsync(varObj.variableCollectionId)
-  } catch (e) { /* remote collection */ }
+  const col = await dsGetCollection(varObj.variableCollectionId)
   if (!col) return null
   const modeId = col.defaultModeId || (col.modes && col.modes[0] && col.modes[0].modeId)
   const raw = varObj.valuesByMode ? varObj.valuesByMode[modeId] : undefined
   if (raw && typeof raw === 'object' && (raw as any).type === 'VARIABLE_ALIAS') {
-    try {
-      const next = await figma.variables.getVariableByIdAsync((raw as any).id)
-      return dsResolveColorValue(next, depth + 1)
-    } catch (e) { return null }
+    return dsResolveColorValue(await dsGetVariable((raw as any).id), depth + 1)
   }
   if (raw && typeof raw === 'object' && typeof (raw as any).r === 'number') return raw
   return null
@@ -250,10 +274,19 @@ const DS_PAINT_FIELDS = ['fills', 'strokes']
 
 interface DsFix { fixBindVariableId: string; fixBindName: string; fixBindField: string }
 
-// Which semantic token carries the same value as the wrongly bound one
+// Which semantic token carries the same value as the wrongly bound one.
+// Один и тот же токен висит на сотнях узлов — считаем подсказку по нему один раз.
 const dsSuggestSemanticFix = async (v: ResolvedVar, field: string, index: number | null): Promise<DsFix | null> => {
+  const cacheKey = `${v.id}|${field}|${index === null ? '' : index}`
+  if (dsFixCache.has(cacheKey)) return dsFixCache.get(cacheKey) || null
+  const fix = await computeSemanticFix(v, field, index)
+  dsFixCache.set(cacheKey, fix)
+  return fix
+}
+
+const computeSemanticFix = async (v: ResolvedVar, field: string, index: number | null): Promise<DsFix | null> => {
   try {
-    const varObj = await figma.variables.getVariableByIdAsync(v.id)
+    const varObj = await dsGetVariable(v.id)
     if (!varObj) return null
 
     if (v.resolvedType === 'COLOR') {
@@ -680,6 +713,9 @@ const checkComponentNaming = (root: ComponentSetNode | ComponentNode): UnboundPr
 // Top-level instances only: what's inside an INSTANCE is its master's business.
 const collectUsedComponents = async (root: ComponentNode): Promise<string[]> => {
   const used = new Set<string>()
+  // Мастер повторяется десятками инстансов — getMainComponentAsync самый дорогой
+  // вызов скана, поэтому имя мастера считаем один раз на мастера
+  const nameByMainId = new Map<string, string>()
 
   const walk = async (node: SceneNode): Promise<void> => {
     if (!('children' in node) || !node.children) return
@@ -687,12 +723,17 @@ const collectUsedComponents = async (root: ComponentNode): Promise<string[]> => 
       if (child.type === 'INSTANCE') {
         try {
           const main = await (child as InstanceNode).getMainComponentAsync()
-          if (main) {
+          if (main && nameByMainId.has(main.id)) {
+            const cached = nameByMainId.get(main.id)!
+            if (cached) used.add(cached)
+          } else if (main) {
             const setName = main.parent && main.parent.type === 'COMPONENT_SET'
               ? (main.parent.name || '').trim()
               : ''
-            const name = setName || (main.name || '').trim()
-            if (name) used.add(main.remote ? `${name} — внешняя библиотека` : name)
+            const rawName = setName || (main.name || '').trim()
+            const name = rawName ? (main.remote ? `${rawName} — внешняя библиотека` : rawName) : ''
+            nameByMainId.set(main.id, name)
+            if (name) used.add(name)
           }
         } catch (e) { /* dangling instance — skip */ }
         continue // не спускаемся внутрь инстанса
@@ -1033,6 +1074,10 @@ function Widget() {
 
   // Выбор находок для массовых действий (ключи те же, что у игнора)
   const [selectedFindings, setSelectedFindings] = useSyncedState<string[]>('selectedFindings', [])
+
+  // Обе проверки принадлежности идут по каждой находке на каждый рендер — держим множествами
+  const ignoredSet = new Set(ignoredFindings)
+  const selectedSet = new Set(selectedFindings)
 
   const toggleSelectFinding = (prop: UnboundProperty) => {
     const key = findingKey(prop)
@@ -1754,14 +1799,27 @@ function Widget() {
         }
       }
 
+      let mark = Date.now()
       const unboundCheck = checkForUnboundProperties(component)
+      dsTiming.unbound += Date.now() - mark
+
+      mark = Date.now()
       const misuseFindings = await checkTokenMisuse(component)
+      dsTiming.misuse += Date.now() - mark
+
       // Standalone components carry their own name/props checks; variants — layer naming
+      mark = Date.now()
       const namingFindings = isVariant
         ? checkLayerNaming(component)
         : [...checkComponentNaming(component), ...checkLayerNaming(component)]
+      dsTiming.naming += Date.now() - mark
+
       const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
-      const usedComponents = await collectUsedComponents(component)
+
+      mark = Date.now()
+      const usedComponents = settings.showUsedComponents ? await collectUsedComponents(component) : []
+      dsTiming.deps += Date.now() - mark
+      dsTiming.components++
 
       // Add individual component/variant entry
       result.push({
@@ -1787,9 +1845,13 @@ function Widget() {
     
     const setUsedComponents = new Map<string, Set<string>>()
 
+    // Раньше здесь был find по всему result на каждый вариант — квадрат по числу компонентов
+    const setEntryByName = new Map<string, ComponentAuditData>()
+    result.forEach(c => { if (c.isComponentSet && c.name) setEntryByName.set(c.name, c) })
+
     result.forEach(component => {
       if (component.isVariant && component.componentSetName) {
-        const componentSetEntry = result.find(c => c.isComponentSet && c.name === component.componentSetName)
+        const componentSetEntry = setEntryByName.get(component.componentSetName)
         if (componentSetEntry) {
           if (component.hasUnboundProperties) {
             componentSetExpandability.set(componentSetEntry.id, true)
@@ -1831,10 +1893,24 @@ function Widget() {
     }
   }
 
+  // Один и тот же массив находок фильтруется по нескольку раз за рендер: фильтр видимости
+  // компонента, счётчик на строке, сам список. Кэш живёт ровно один рендер — WeakMap
+  // пересоздаётся вместе с телом виджета, поэтому смена настроек или игноров его не переживает.
+  const filterCache = new WeakMap<UnboundProperty[], UnboundProperty[]>()
+
   const filterUnboundPropertiesWithZeroValues = (properties: UnboundProperty[]): UnboundProperty[] => {
+    const cached = filterCache.get(properties)
+    if (cached) return cached
+    const result = filterUnboundPropertiesUncached(properties)
+    filterCache.set(properties, result)
+    return result
+  }
+
+  const filterUnboundPropertiesUncached = (properties: UnboundProperty[]): UnboundProperty[] => {
     return properties.filter(prop => {
-      // Ignored by user — hidden everywhere (counters, rows, component filter)
-      if (ignoredFindings.length > 0 && ignoredFindings.indexOf(findingKey(prop)) !== -1) {
+      // Ignored by user — hidden everywhere (counters, rows, component filter).
+      // Set, а не indexOf по массиву: фильтр гоняется по каждой находке на каждый рендер
+      if (ignoredSet.size > 0 && ignoredSet.has(findingKey(prop))) {
         return false
       }
 
@@ -2320,7 +2396,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     }
 
     const allKeys = filteredProperties.map(findingKey)
-    const selectedProps = filteredProperties.filter(p => selectedFindings.indexOf(findingKey(p)) !== -1)
+    const selectedProps = filteredProperties.filter(p => selectedSet.has(findingKey(p)))
     const allSelected = selectedProps.length === filteredProperties.length && filteredProperties.length > 0
     const fixableCount = selectedProps.filter(isAutoFixable).length
 
@@ -2389,7 +2465,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
 
         {Object.keys(groupedProperties).map((type, typeIndex) => {
           const groupKeys = (groupedProperties[type] || []).map(findingKey)
-          const groupAllSelected = groupKeys.every(k => selectedFindings.indexOf(k) !== -1)
+          const groupAllSelected = groupKeys.every(k => selectedSet.has(k))
           return (
           <AutoLayout key={`type-${type}-${typeIndex}`} direction="vertical" spacing={8} width="fill-parent">
             <AutoLayout direction="horizontal" spacing={6} width="fill-parent" verticalAlignItems="center">
@@ -2421,7 +2497,7 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
                       «Игнор» / «Привязать» / «Исправить» уводили вьюпорт к узлу. */}
                   <AutoLayout direction="horizontal" spacing={8} width="fill-parent" verticalAlignItems="center">
                     <Checkbox
-                      checked={selectedFindings.indexOf(findingKey(prop)) !== -1}
+                      checked={selectedSet.has(findingKey(prop))}
                       onClick={() => toggleSelectFinding(prop)}
                     />
                     <AutoLayout direction="vertical" spacing={4} width="fill-parent">
@@ -3322,9 +3398,17 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         componentCount: 0
       }])
 
+      dsResetCaches()
+      dsResetTiming()
+      const scanStart = Date.now()
+
       buildSlugRegistry([currentPage])
+      let mark = Date.now()
       await buildTokenMaps()
+      dsTiming.tokenMaps = Date.now() - mark
+
       const pageComponents = await processPageComponents(currentPage)
+      dsLogTiming(Date.now() - scanStart)
 
       setPageProgress([{
         name: safeCurrentPageName,
@@ -3417,8 +3501,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       const processedComponentSets = new Set<string>()
       const result: ComponentAuditData[] = []
 
+      dsResetCaches()
+      dsResetTiming()
+      const scanStart = Date.now()
+
       buildSlugRegistry([currentPage])
+      const tokenMapsMark = Date.now()
       await buildTokenMaps()
+      dsTiming.tokenMaps = Date.now() - tokenMapsMark
 
       // Process each selected component
       for (const component of selectedComponents) {
@@ -3448,13 +3538,26 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
           }
         }
 
+        let mark = Date.now()
         const unboundCheck = checkForUnboundProperties(component)
+        dsTiming.unbound += Date.now() - mark
+
+        mark = Date.now()
         const misuseFindings = await checkTokenMisuse(component)
+        dsTiming.misuse += Date.now() - mark
+
+        mark = Date.now()
         const namingFindings = isVariant
           ? [...setNamingFindings, ...checkLayerNaming(component)]
           : [...checkComponentNaming(component), ...checkLayerNaming(component)]
+        dsTiming.naming += Date.now() - mark
+
         const allProperties = [...unboundCheck.properties, ...misuseFindings, ...namingFindings]
-        const usedComponents = await collectUsedComponents(component)
+
+        mark = Date.now()
+        const usedComponents = settings.showUsedComponents ? await collectUsedComponents(component) : []
+        dsTiming.deps += Date.now() - mark
+        dsTiming.components++
 
         result.push({
           id: component.id,
@@ -3474,12 +3577,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
         })
       }
 
+      dsLogTiming(Date.now() - scanStart)
+
       setPageProgress([{
         name: safePageName,
         status: 'complete',
         componentCount: selectedComponents.length
       }])
-      
+
       // Clean and serialize the data before storing
       try {
         const cleanedComponents = cleanComponentData(result)
