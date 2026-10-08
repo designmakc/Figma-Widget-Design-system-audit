@@ -1,5 +1,5 @@
 const { widget } = figma
-const { useSyncedState, useEffect, AutoLayout, Text, SVG, Rectangle } = widget
+const { useSyncedState, AutoLayout, Text, SVG, Rectangle } = widget
 
 // Helper function to ensure safe text rendering - never returns empty strings
 const safeText = (value: any): string => {
@@ -536,6 +536,9 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
 
     if ('children' in node && node.children) {
       for (const child of node.children) {
+        // Внутри инстанса — дело его мастера: привязки унаследованы, а «Привязать»
+        // правил бы слой чужого компонента. Как в collectUsedComponents и checkLayerNaming.
+        if (child.type === 'INSTANCE') continue
         await walk(child, path)
       }
     }
@@ -921,15 +924,6 @@ const ComponentIcon = ({ color = "#000000", size = 16 }: { color?: string, size?
   />
 )
 
-const SettingsIcon = ({ color = "#666666", size = 16 }: { color?: string, size?: number }) => (
-  <SVG
-    src={`<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/>
-      <circle cx="12" cy="12" r="3"/>
-    </svg>`}
-  />
-)
-
 interface SettingsState {
   showMissingDescription: boolean
   showMissingDocsLink: boolean
@@ -1197,20 +1191,6 @@ function Widget() {
     figma.notify(`✅ Переименовано: «${prop.fixRename}»`)
   }
 
-  const getNodePath = (node: SceneNode, rootNode: SceneNode): string => {
-    const path: string[] = []
-    let current: SceneNode | null = node
-    
-    while (current && current !== rootNode && current.parent) {
-      if (current.name) {
-        path.unshift(current.name)
-      }
-      current = current.parent as SceneNode
-    }
-    
-    return path.length > 0 ? path.join(' > ') : 'Root'
-  }
-
   const formatColor = (color: RGB): string => {
     const r = Math.round(color.r * 255)
     const g = Math.round(color.g * 255)
@@ -1241,6 +1221,7 @@ function Widget() {
       if ('fills' in node && node.fills && node.fills !== figma.mixed) {
         const fills = node.fills as readonly Paint[];
         fills.forEach((fill, index) => {
+          if (fill.visible === false) return;
           if (fill.type === 'SOLID') {
             // Check for fill color variables - stored in boundVariables.fills array  
             const fillBindings = node.boundVariables && 
@@ -1320,7 +1301,6 @@ function Widget() {
               const bottomBound = node.boundVariables && (node.boundVariables as any).strokeBottomWeight;
               const leftBound = node.boundVariables && (node.boundVariables as any).strokeLeftWeight;
               
-              const hasIndividualBindings = (topBound || rightBound || bottomBound || leftBound);
               const allSidesBound = topBound && rightBound && bottomBound && leftBound &&
                                    topBound.type === 'VARIABLE_ALIAS' &&
                                    rightBound.type === 'VARIABLE_ALIAS' &&
@@ -1705,6 +1685,8 @@ function Widget() {
 
       if ('children' in node && node.children) {
         node.children.forEach(child => {
+          // Инстанс — дело его мастера (см. checkTokenMisuse)
+          if (child.type === 'INSTANCE') return;
           checkNodeForUnboundProps(child, currentPath);
         });
       }
@@ -1738,7 +1720,6 @@ function Widget() {
 
   const processPageComponents = async (page: PageNode): Promise<ComponentAuditData[]> => {
     const components = page.findAll(node => node.type === 'COMPONENT') as ComponentNode[]
-    const componentSets = page.findAll(node => node.type === 'COMPONENT_SET') as ComponentSetNode[]
     const safePageName = (page.name || '').trim() || 'Unnamed Page'
     const currentPageName = (figma.currentPage.name || '').trim() || 'Current Page'
 
@@ -1749,7 +1730,7 @@ function Widget() {
     for (const component of components) {
       let componentSetName: string | undefined
       let variantProperties: Record<string, string> | undefined
-      let displayName = (component.name || '').trim() || 'Unnamed Component'
+      const displayName = (component.name || '').trim() || 'Unnamed Component'
       let isVariant = false
 
       if (component.parent && component.parent.type === 'COMPONENT_SET') {
@@ -2360,11 +2341,10 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
     )
   }
 
-  const UnboundPropertiesDetail = ({ properties, componentId, isOnCurrentPage, settings }: { 
+  const UnboundPropertiesDetail = ({ properties, componentId, isOnCurrentPage }: { 
     properties: UnboundProperty[], 
     componentId: string, 
-    isOnCurrentPage: boolean,
-    settings: SettingsState
+    isOnCurrentPage: boolean
   }) => {
     try {
       if (!properties || properties.length === 0) return null
@@ -2478,7 +2458,6 @@ const navigateToComponent = async (componentId: string, specificNodeId?: string)
             {(groupedProperties[type] || []).map((prop, index) => {
               const safeProperty = safeText(prop.property)
               const safeCurrentValue = safeText(prop.currentValue)
-              const safeNodePath = safeText(prop.nodePath)
               const targetNodeId = prop.nodeId || componentId  // Use specific node ID if available
               
               return (
@@ -2598,115 +2577,28 @@ const SettingsPanel = ({
   ignoredCount: number,
   onResetIgnores: () => void
 }) => {
+  // Группа фильтров = «шапка» + дети. Шапка ничего не фильтрует сама: её состояние —
+  // «все дети включены», клик по ней включает/выключает всех детей разом. Раньше шапкой
+  // служил один из детей (showStrokeColorValues, showFontFamilyValues, …), и выключение
+  // соседа гасило и его — находки по цвету обводки пропадали при снятии «Толщины».
+  const SETTING_GROUPS: Partial<Record<keyof SettingsState, (keyof SettingsState)[]>> = {
+    showStrokeColorValues: ['showStrokeColorValues', 'showStrokeWeightValues'],
+    showFontFamilyValues: ['showFontFamilyValues', 'showFontSizeValues', 'showLineHeightValues'],
+    showPaddingValues: ['showPaddingValues', 'showItemSpacingValues', 'showPaddingTopValues', 'showPaddingRightValues', 'showPaddingBottomValues', 'showPaddingLeftValues'],
+    showAllCornersValues: ['showAllCornersValues', 'showTopLeftRadiusValues', 'showTopRightRadiusValues', 'showBottomLeftRadiusValues', 'showBottomRightRadiusValues'],
+    showEffectValues: ['showEffectValues', 'showEffectColorValues', 'showEffectValuesValues']
+  }
+  const groupAllOn = (parent: keyof SettingsState): boolean =>
+    (SETTING_GROUPS[parent] || [parent]).every(k => settings[k])
+
   const toggleSetting = (key: keyof SettingsState) => {
-    const newValue = !settings[key]
-    const newSettings = { ...settings }
-    
-    // Handle hierarchical relationships for grouped settings
-    
-    // Stroke group - first checkbox acts as "toggle all"
-    if (key === 'showStrokeColorValues') {
-      // Parent: toggle all children in stroke group
-      newSettings.showStrokeColorValues = newValue
-      newSettings.showStrokeWeightValues = newValue
-    } else if (key === 'showStrokeWeightValues') {
-      // Child affects parent
-      newSettings.showStrokeWeightValues = newValue
-      if (!newValue) {
-        newSettings.showStrokeColorValues = false
-      } else {
-        // Turn on parent only if all siblings are on
-        newSettings.showStrokeColorValues = newSettings.showStrokeColorValues && newValue
-      }
-    }
-    // Text group - first checkbox acts as "toggle all"
-    else if (key === 'showFontFamilyValues') {
-      // Parent: toggle all children in text group
-      newSettings.showFontFamilyValues = newValue
-      newSettings.showFontSizeValues = newValue
-      newSettings.showLineHeightValues = newValue
-    } else if (['showFontSizeValues', 'showLineHeightValues'].includes(key)) {
-      // Child affects parent
-      newSettings[key] = newValue
-      if (!newValue) {
-        newSettings.showFontFamilyValues = false
-      } else {
-        // Turn on parent only if all siblings are on
-        const allTextOn = newSettings.showFontFamilyValues && 
-                         newSettings.showFontSizeValues && 
-                         newSettings.showLineHeightValues
-        newSettings.showFontFamilyValues = allTextOn
-      }
-    }
-    // Spacing group - "Auto layout" is parent of both spacing AND padding directions
-    else if (key === 'showPaddingValues') {
-      // Parent: toggle all children (spacing + padding directions)
-      newSettings.showPaddingValues = newValue
-      newSettings.showItemSpacingValues = newValue
-      newSettings.showPaddingTopValues = newValue
-      newSettings.showPaddingRightValues = newValue
-      newSettings.showPaddingBottomValues = newValue
-      newSettings.showPaddingLeftValues = newValue
-    } else if (['showItemSpacingValues', 'showPaddingTopValues', 'showPaddingRightValues', 'showPaddingBottomValues', 'showPaddingLeftValues'].includes(key)) {
-      // Child: update self and parent
-      newSettings[key] = newValue
-      // If turning off, turn off parent. If turning on, check if all siblings are on
-      if (!newValue) {
-        newSettings.showPaddingValues = false
-      } else {
-        const allSpacingOn = newSettings.showItemSpacingValues &&
-                            newSettings.showPaddingTopValues && 
-                            newSettings.showPaddingRightValues && 
-                            newSettings.showPaddingBottomValues && 
-                            newSettings.showPaddingLeftValues
-        newSettings.showPaddingValues = allSpacingOn
-      }
-    }
-    // Corner Radius group
-    else if (key === 'showAllCornersValues') {
-      // Parent: toggle all children
-      newSettings.showAllCornersValues = newValue
-      newSettings.showTopLeftRadiusValues = newValue
-      newSettings.showTopRightRadiusValues = newValue
-      newSettings.showBottomLeftRadiusValues = newValue
-      newSettings.showBottomRightRadiusValues = newValue
-    } else if (['showTopLeftRadiusValues', 'showTopRightRadiusValues', 'showBottomLeftRadiusValues', 'showBottomRightRadiusValues'].includes(key)) {
-      // Child: update self and parent
-      newSettings[key] = newValue
-      // If turning off, turn off parent. If turning on, check if all siblings are on
-      if (!newValue) {
-        newSettings.showAllCornersValues = false
-      } else {
-        const allCornersOn = newSettings.showTopLeftRadiusValues && 
-                            newSettings.showTopRightRadiusValues && 
-                            newSettings.showBottomLeftRadiusValues && 
-                            newSettings.showBottomRightRadiusValues
-        newSettings.showAllCornersValues = allCornersOn
-      }
-    }
-    // Effects group
-    else if (key === 'showEffectValues') {
-      // Parent: toggle all children
-      newSettings.showEffectValues = newValue
-      newSettings.showEffectColorValues = newValue
-      newSettings.showEffectValuesValues = newValue
-    } else if (['showEffectColorValues', 'showEffectValuesValues'].includes(key)) {
-      // Child: update self and parent
-      newSettings[key] = newValue
-      // If turning off, turn off parent. If turning on, check if all siblings are on
-      if (!newValue) {
-        newSettings.showEffectValues = false
-      } else {
-        const allEffectsOn = newSettings.showEffectColorValues && 
-                            newSettings.showEffectValuesValues
-        newSettings.showEffectValues = allEffectsOn
-      }
-    } else {
-      // No hierarchy, just toggle
-      newSettings[key] = newValue
-    }
-    
-    setSettings(newSettings)
+    setSettings({ ...settings, [key]: !settings[key] })
+  }
+  const toggleGroup = (parent: keyof SettingsState) => {
+    const on = !groupAllOn(parent)
+    const next = { ...settings }
+    for (const k of SETTING_GROUPS[parent] || [parent]) (next as any)[k] = on
+    setSettings(next)
   }
   
   // Helper component for simple checkboxes
@@ -2876,24 +2768,22 @@ const SettingsPanel = ({
             
             {/* Stroke group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showStrokeColorValues} label="Обводка" onClick={() => toggleSetting('showStrokeColorValues')} isFirst={true} />
+              <SimpleCheckbox checked={groupAllOn('showStrokeColorValues')} label="Обводка" onClick={() => toggleGroup('showStrokeColorValues')} isFirst={true} />
               <SimpleCheckbox checked={settings.showStrokeColorValues} label="Цвет обводки" onClick={() => toggleSetting('showStrokeColorValues')} />
               <SimpleCheckbox checked={settings.showStrokeWeightValues} label="Толщина" onClick={() => toggleSetting('showStrokeWeightValues')} isLast={true} />
             </AutoLayout>
             
             {/* Text group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showFontFamilyValues} label="Текст" onClick={() => toggleSetting('showFontFamilyValues')} isFirst={true} />
+              <SimpleCheckbox checked={groupAllOn('showFontFamilyValues')} label="Текст" onClick={() => toggleGroup('showFontFamilyValues')} isFirst={true} />
               <SimpleCheckbox checked={settings.showFontFamilyValues} label="Шрифт" onClick={() => toggleSetting('showFontFamilyValues')} />
               <SimpleCheckbox checked={settings.showFontSizeValues} label="Кегль" onClick={() => toggleSetting('showFontSizeValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Интерлиньяж" onClick={() => toggleSetting('showLineHeightValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Трекинг" onClick={() => toggleSetting('showLineHeightValues')} />
-              <SimpleCheckbox checked={settings.showLineHeightValues} label="Отступ абзаца" onClick={() => toggleSetting('showLineHeightValues')} isLast={true} />
+              <SimpleCheckbox checked={settings.showLineHeightValues} label="Интерлиньяж" onClick={() => toggleSetting('showLineHeightValues')} isLast={true} />
             </AutoLayout>
             
             {/* Auto layout / Spacing group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showPaddingValues} label="Auto layout" onClick={() => toggleSetting('showPaddingValues')} isFirst={true} />
+              <SimpleCheckbox checked={groupAllOn('showPaddingValues')} label="Auto layout" onClick={() => toggleGroup('showPaddingValues')} isFirst={true} />
               <SimpleCheckbox checked={settings.showItemSpacingValues} label="Gap" onClick={() => toggleSetting('showItemSpacingValues')} />
               <SimpleCheckbox checked={settings.showPaddingTopValues} label="Сверху" onClick={() => toggleSetting('showPaddingTopValues')} />
               <SimpleCheckbox checked={settings.showPaddingRightValues} label="Справа" onClick={() => toggleSetting('showPaddingRightValues')} />
@@ -2903,7 +2793,7 @@ const SettingsPanel = ({
             
             {/* Corner radius group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showAllCornersValues} label="Радиус углов" onClick={() => toggleSetting('showAllCornersValues')} isFirst={true} />
+              <SimpleCheckbox checked={groupAllOn('showAllCornersValues')} label="Радиус углов" onClick={() => toggleGroup('showAllCornersValues')} isFirst={true} />
               <SimpleCheckbox checked={settings.showTopLeftRadiusValues} label="Верх-лево" onClick={() => toggleSetting('showTopLeftRadiusValues')} />
               <SimpleCheckbox checked={settings.showTopRightRadiusValues} label="Верх-право" onClick={() => toggleSetting('showTopRightRadiusValues')} />
               <SimpleCheckbox checked={settings.showBottomLeftRadiusValues} label="Низ-лево" onClick={() => toggleSetting('showBottomLeftRadiusValues')} />
@@ -2912,7 +2802,7 @@ const SettingsPanel = ({
             
             {/* Effects group */}
             <AutoLayout direction="horizontal" spacing={1} wrap={true} fill={"#F5F5F5"} stroke="#eee" strokeWidth={1} cornerRadius={12} padding={2} width="hug-contents">
-              <SimpleCheckbox checked={settings.showEffectValues} label="Эффекты" onClick={() => toggleSetting('showEffectValues')} isFirst={true} />
+              <SimpleCheckbox checked={groupAllOn('showEffectValues')} label="Эффекты" onClick={() => toggleGroup('showEffectValues')} isFirst={true} />
               <SimpleCheckbox checked={settings.showEffectColorValues} label="Цвет эффекта" onClick={() => toggleSetting('showEffectColorValues')} />
               <SimpleCheckbox checked={settings.showEffectValuesValues} label="Параметры эффекта" onClick={() => toggleSetting('showEffectValuesValues')} isLast={true} />
             </AutoLayout>
@@ -3208,7 +3098,6 @@ const ComponentTable = ({ components, displayedCount, settings }: {
                       properties={safeComponent.unboundProperties} 
                       componentId={safeComponent.id}
                       isOnCurrentPage={safeComponent.isOnCurrentPage}
-                      settings={settings}
                     />
                   </AutoLayout>
                 )
@@ -3403,7 +3292,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       const scanStart = Date.now()
 
       buildSlugRegistry([currentPage])
-      let mark = Date.now()
+      const mark = Date.now()
       await buildTokenMaps()
       dsTiming.tokenMaps = Date.now() - mark
 
@@ -3430,21 +3319,14 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       setCurrentProgress(`Глубокий скан завершён: найдено ${pageComponents.length} комп.`)
 
       setLastScanTime(new Date().toUTCString())
-      
-      // Auto-collapse the progress accordion after scan completes
-      setTimeout(() => {
-        setIsProgressExpanded(false)
-      }, 1000)
-        
+      // setTimeout здесь не сработает: код виджета завершается вместе с обработчиком —
+      // сворачиваем сразу, плашку с итогом оставляем до следующего скана/сброса
+      setIsProgressExpanded(false)
     } catch (error) {
       console.error('Error during deep scan:', error)
       setCurrentProgress('Ошибка при глубоком скане')
     } finally {
       setIsDeepScanning(false)
-      setTimeout(() => {
-        setCurrentProgress('')
-        setPageProgress([])
-      }, 3000)
     }
   }
 
@@ -3514,7 +3396,7 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       for (const component of selectedComponents) {
         let componentSetName: string | undefined
         let variantProperties: Record<string, string> | undefined
-        let displayName = (component.name || '').trim() || 'Unnamed Component'
+        const displayName = (component.name || '').trim() || 'Unnamed Component'
         let isVariant = false
         // Selection results have no set rows — attach set-level naming findings
         // to the first scanned variant of each set
@@ -3598,22 +3480,13 @@ const PageAccordion = ({ pageData }: { pageData: PageData }) => {
       setPageDisplayCounts({ [safePageName]: SELECTION_CHUNK_SIZE })
       setCurrentProgress(`Скан завершён: найдено ${selectedComponents.length} комп. в выделении`)
       setLastScanTime(new Date().toUTCString())
-      
-      // Auto-collapse the progress accordion after scan completes
-      setTimeout(() => {
-        setIsProgressExpanded(false)
-      }, 1000)
-      
+      setIsProgressExpanded(false) // см. runDeepScanCurrentPage
     } catch (error) {
       console.error('Error scanning selection:', error)
       figma.notify('❌ Ошибка сканирования выделения', { error: true })
       setCurrentProgress('Ошибка при сканировании')
     } finally {
       setIsDeepScanning(false)
-      // Clear page progress after a delay
-      setTimeout(() => {
-        setPageProgress([])
-      }, 3000)
     }
   }
 
