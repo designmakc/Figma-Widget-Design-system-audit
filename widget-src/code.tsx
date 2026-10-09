@@ -162,6 +162,17 @@ const buildSlugRegistry = (pages: PageNode[]) => {
   })
 }
 
+// Middle segment of a token name that repeats a component slug, or null.
+// `layout/*` is exempt: `layout/card/*` and `layout/container/card/*` are the
+// layout namespace of docs/rules/tokens/naming.md (constants that do not follow
+// the tier), «card» there names a layout zone, not the Card component.
+export const dsComponentTierHit = (name: string, slugs: Set<string>): string | null => {
+  const segments = name.split('/')
+  if (segments[0] === 'layout') return null
+  const hit = segments.slice(1, -1).find(seg => slugs.has(seg.toLowerCase()))
+  return hit || null
+}
+
 // ---------------------------------------------------------------------------
 // Token suggestions: value → semantic-token maps, built once per scan.
 // Enables "Привязать" auto-fix on unbound findings and semantic replacements
@@ -444,9 +455,7 @@ const checkTokenMisuse = async (root: ComponentNode): Promise<UnboundProperty[]>
     // цвета легальны наравне с opacity/disabled overlay — проверка снята.
 
     // tokens-no-component-tier (DEC-014, soft): middle segment must not repeat a component slug
-    const segments = v.name.split('/')
-    const middles = segments.slice(1, -1)
-    const hit = middles.find(seg => dsComponentSlugs.has(seg.toLowerCase()))
+    const hit = dsComponentTierHit(v.name, dsComponentSlugs)
     if (hit) {
       report(node, path, propLabel, 'tokens-no-component-tier', `«${v.name}» — сегмент «${hit}» совпадает с именем компонента; токены должны быть role/category-tier (tokens-no-component-tier, DEC-014)`)
     }

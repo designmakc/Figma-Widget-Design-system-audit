@@ -31,7 +31,7 @@ const src = Buffer.from(built.outputFiles[0].text).toString('base64')
 const {
   dsIsSemanticCollection, dsColorKey, dsCollectBindings,
   dsIsInSubComponentSection, dsSplitHiddenPrefix,
-  DS_LAYOUT_NAMESPACE, DS_LAYOUT_ROOTLESS,
+  DS_LAYOUT_NAMESPACE, DS_LAYOUT_ROOTLESS, dsComponentTierHit,
   isAutoFixable
 } = await import('data:text/javascript;base64,' + src)
 
@@ -107,4 +107,13 @@ test('собираются привязки всех форм boundVariables', (
     { field: 'componentProperties.isLoading#1:0', index: null, id: 'v4' },
     { field: 'fontSize', index: null, id: 'v5' }
   ])
+})
+
+test('component-tier: layout/card/* — раскладочная ветка, не имя компонента', () => {
+  const slugs = new Set(['card', 'button'])
+  assert.equal(dsComponentTierHit('layout/card/gap/horizontal', slugs), null)
+  assert.equal(dsComponentTierHit('layout/container/card/minWidth/perRow2', slugs), null)
+  assert.equal(dsComponentTierHit('space/card/padding', slugs), 'card')
+  assert.equal(dsComponentTierHit('color/button/primary/bg', slugs), 'button')
+  assert.equal(dsComponentTierHit('color/action/primary/bg', slugs), null)
 })
